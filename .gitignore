@@ -1,0 +1,6 @@
+# Ignore everything
+*
+# Do not ignore .gitignore itself
+!.gitignore
+# Do not ignore .vhd files
+!*.vhd
