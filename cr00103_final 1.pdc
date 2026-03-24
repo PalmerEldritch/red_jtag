@@ -1,0 +1,73 @@
+# ==============================================================================
+# Pin Constraints for Trenz CR00103 - HSOSC Version (No External Clock!)
+# Certus-NX LFD2NX-40 (caBGA256)
+# ==============================================================================
+
+# ==============================================================================
+# FT2232H Channel B - Data Bus (BDBUS0-7)
+# ==============================================================================
+ldc_set_location -site {C11} [get_ports {ft_data[0]}]
+ldc_set_location -site {F11} [get_ports {ft_data[1]}]
+ldc_set_location -site {D12} [get_ports {ft_data[2]}]
+ldc_set_location -site {E12} [get_ports {ft_data[3]}]
+ldc_set_location -site {C14} [get_ports {ft_data[4]}]
+ldc_set_location -site {D14} [get_ports {ft_data[5]}]
+ldc_set_location -site {E13} [get_ports {ft_data[6]}]
+ldc_set_location -site {E14} [get_ports {ft_data[7]}]
+
+# ==============================================================================
+# FT2232H Channel B - Control Signals (BCBUS0-4)
+# ==============================================================================
+ldc_set_location -site {G14} [get_ports ft_rxf_n]
+ldc_set_location -site {F10} [get_ports ft_txe_n]
+ldc_set_location -site {G13} [get_ports ft_rd_n]
+ldc_set_location -site {G10} [get_ports ft_wr_n]
+ldc_set_location -site {G12} [get_ports ft_siwu_n]
+
+# ==============================================================================
+# JTAG IN-/OUTPUTS
+# ==============================================================================
+ ldc_set_location -site {G5} [get_ports jtag_tck]
+ ldc_set_location -site {F3} [get_ports jtag_tms]
+ ldc_set_location -site {F5} [get_ports jtag_tdi]
+ ldc_set_location -site {G1} [get_ports jtag_tdo]
+
+# ==============================================================================
+# Debug LEDs
+# ==============================================================================
+ldc_set_location -site {A8} [get_ports {led[0]}]
+ldc_set_location -site {B8} [get_ports {led[1]}]
+
+
+# ==============================================================================
+# I/O Standards - LVCMOS33
+# ==============================================================================
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[0]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[1]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[2]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[3]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[4]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[5]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[6]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports {ft_data[7]}]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports ft_rxf_n]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports ft_txe_n]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports ft_rd_n]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports ft_wr_n]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports ft_siwu_n]
+
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports jtag_tck]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports jtag_tms]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports jtag_tdi]
+ldc_set_port -iobuf {IO_TYPE=LVCMOS33} [get_ports jtag_tdo]
+
+# ==============================================================================
+# Timing Constraints - HSOSC generates ~56 MHz internal clock
+# ==============================================================================
+# Internal oscillator - create clock on the HFOSC output
+#create_clock -name {hf_osc} -period 17.857 [get_pins u_osc/HFCLKOUT]
+
+# For internal OSCA, create clock on the net instead
+create_clock -name {clk_int} -period 17.857 [get_nets clk]
+
+# No external clock pin needed!
