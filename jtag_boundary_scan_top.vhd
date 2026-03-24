@@ -6,6 +6,7 @@ use work.jtag_pkg.all;
 entity jtag_boundary_scan_top is
     generic (
         BSR_LENGTH      : natural := 362;
+        MAX_IR_BITS     : natural := MAX_IR_LENGTH;
         IR_LENGTH       : natural := 4;
         JTAG_DIV_WIDTH  : natural := 8;
         JTAG_DIV_VALUE  : natural := 255;
@@ -51,11 +52,6 @@ architecture rtl of jtag_boundary_scan_top is
         );
     end component;
 
-    constant JTAG_IDCODE      : std_logic_vector(7 downto 0) := x"02";
-    constant BSCAN_OP_SAMPLE  : std_logic_vector(2 downto 0) := "000";
-    constant BSCAN_OP_LOAD    : std_logic_vector(2 downto 0) := "001";
-    constant BSCAN_OP_SET_PIN : std_logic_vector(2 downto 0) := "010";
-    constant BSCAN_OP_READ    : std_logic_vector(2 downto 0) := "011";
     constant MAX_RESP_BITS    : natural := max_nat(BSR_LENGTH, 128);
 
     type exec_state_t is (
@@ -87,13 +83,18 @@ architecture rtl of jtag_boundary_scan_top is
     signal parser_req_kind   : host_req_kind_t;
     signal parser_req_byte   : std_logic_vector(7 downto 0);
     signal parser_req_word   : unsigned(15 downto 0);
-    signal parser_req_data   : std_logic_vector(BSR_LENGTH-1 downto 0);
-    signal parser_req_len    : unsigned(15 downto 0);
+    signal parser_req_ir_len : unsigned(15 downto 0);
+    signal parser_req_ir_data: std_logic_vector(MAX_IR_BITS-1 downto 0);
+    signal parser_req_dr_len : unsigned(15 downto 0);
+    signal parser_req_dr_data: std_logic_vector(BSR_LENGTH-1 downto 0);
+    signal parser_req_pin_num: unsigned(15 downto 0);
+    signal parser_req_pin_val: std_logic;
     signal parser_busy       : std_logic;
 
     signal raw_jtag_req_valid   : std_logic := '0';
     signal raw_jtag_req_kind    : jtag_req_kind_t := JTAG_REQ_NONE;
-    signal raw_jtag_req_ir      : std_logic_vector(7 downto 0) := (others => '0');
+    signal raw_jtag_req_ir_len  : unsigned(15 downto 0) := (others => '0');
+    signal raw_jtag_req_ir      : std_logic_vector(MAX_IR_BITS-1 downto 0) := (others => '0');
     signal raw_jtag_req_dr_len  : unsigned(15 downto 0) := (others => '0');
     signal raw_jtag_req_dr_data : std_logic_vector(BSR_LENGTH-1 downto 0) := (others => '0');
     signal raw_jtag_req_tms     : std_logic := '0';
@@ -101,7 +102,8 @@ architecture rtl of jtag_boundary_scan_top is
 
     signal jtag_req_valid    : std_logic;
     signal jtag_req_kind     : jtag_req_kind_t;
-    signal jtag_req_ir       : std_logic_vector(7 downto 0);
+    signal jtag_req_ir_len   : unsigned(15 downto 0);
+    signal jtag_req_ir       : std_logic_vector(MAX_IR_BITS-1 downto 0);
     signal jtag_req_dr_len   : unsigned(15 downto 0);
     signal jtag_req_dr_data  : std_logic_vector(BSR_LENGTH-1 downto 0);
     signal jtag_req_tms      : std_logic;
@@ -112,7 +114,11 @@ architecture rtl of jtag_boundary_scan_top is
     signal jtag_rsp_len      : unsigned(15 downto 0);
 
     signal bscan_req_valid   : std_logic := '0';
-    signal bscan_req_op      : std_logic_vector(2 downto 0) := (others => '0');
+    signal bscan_req_kind    : bscan_req_kind_t := BSCAN_REQ_NONE;
+    signal bscan_req_ir_len  : unsigned(15 downto 0) := (others => '0');
+    signal bscan_req_sample_ir : std_logic_vector(MAX_IR_BITS-1 downto 0) := (others => '0');
+    signal bscan_req_extest_ir : std_logic_vector(MAX_IR_BITS-1 downto 0) := (others => '0');
+    signal bscan_req_dr_len  : unsigned(15 downto 0) := (others => '0');
     signal bscan_req_pin_num : unsigned(15 downto 0) := (others => '0');
     signal bscan_req_pin_val : std_logic := '0';
     signal bscan_req_data    : std_logic_vector(BSR_LENGTH-1 downto 0) := (others => '0');
@@ -122,7 +128,8 @@ architecture rtl of jtag_boundary_scan_top is
     signal bscan_rsp_pin     : std_logic;
     signal bscan_jtag_req_valid : std_logic;
     signal bscan_jtag_req_kind  : jtag_req_kind_t;
-    signal bscan_jtag_req_ir    : std_logic_vector(7 downto 0);
+    signal bscan_jtag_req_ir_len: unsigned(15 downto 0);
+    signal bscan_jtag_req_ir    : std_logic_vector(MAX_IR_BITS-1 downto 0);
     signal bscan_jtag_req_dr_len: unsigned(15 downto 0);
     signal bscan_jtag_req_data  : std_logic_vector(BSR_LENGTH-1 downto 0);
 
@@ -136,12 +143,13 @@ architecture rtl of jtag_boundary_scan_top is
 
 begin
 
-    led(0) <= hb_cnt(24) when led_reg(0) = '0' else '1';
-    led(1) <= led_reg(1);
+    led(0) <= hb_cnt(22) when led_reg(0) = '0' else '1';
+    led(1) <= '1' when led_reg(1) = '0' else '0';
 
     parser_busy <= '1' when state /= ST_IDLE else '0';
     jtag_req_valid <= bscan_jtag_req_valid when state = ST_WAIT_BSCAN else raw_jtag_req_valid;
     jtag_req_kind <= bscan_jtag_req_kind when state = ST_WAIT_BSCAN else raw_jtag_req_kind;
+    jtag_req_ir_len <= bscan_jtag_req_ir_len when state = ST_WAIT_BSCAN else raw_jtag_req_ir_len;
     jtag_req_ir <= bscan_jtag_req_ir when state = ST_WAIT_BSCAN else raw_jtag_req_ir;
     jtag_req_dr_len <= bscan_jtag_req_dr_len when state = ST_WAIT_BSCAN else raw_jtag_req_dr_len;
     jtag_req_dr_data <= bscan_jtag_req_data when state = ST_WAIT_BSCAN else raw_jtag_req_dr_data;
@@ -178,7 +186,9 @@ begin
 
     u_parser: entity work.host_cmd_parser
         generic map (
-            BSR_LENGTH => BSR_LENGTH
+            LEGACY_BSR_LENGTH => BSR_LENGTH,
+            MAX_IR_BITS => MAX_IR_BITS,
+            MAX_DR_BITS => BSR_LENGTH
         )
         port map (
             clk => clk,
@@ -189,14 +199,19 @@ begin
             req_kind => parser_req_kind,
             req_byte => parser_req_byte,
             req_word => parser_req_word,
-            req_data => parser_req_data,
-            req_data_len => parser_req_len,
+            req_ir_len => parser_req_ir_len,
+            req_ir_data => parser_req_ir_data,
+            req_dr_len => parser_req_dr_len,
+            req_dr_data => parser_req_dr_data,
+            req_pin_num => parser_req_pin_num,
+            req_pin_val => parser_req_pin_val,
             busy => parser_busy
         );
 
     u_jtag: entity work.jtag_master
         generic map (
             MAX_SHIFT_BITS => BSR_LENGTH,
+            MAX_IR_BITS => MAX_IR_BITS,
             IR_LENGTH => IR_LENGTH,
             JTAG_DIV_WIDTH => JTAG_DIV_WIDTH,
             JTAG_DIV_VALUE => JTAG_DIV_VALUE
@@ -206,7 +221,8 @@ begin
             rst_n => rst_n_int,
             req_valid => jtag_req_valid,
             req_kind => jtag_req_kind,
-            req_ir => jtag_req_ir,
+            req_ir_len => jtag_req_ir_len,
+            req_ir_data => jtag_req_ir,
             req_dr_len => jtag_req_dr_len,
             req_dr_data => jtag_req_dr_data,
             req_tms_value => jtag_req_tms,
@@ -223,24 +239,29 @@ begin
 
     u_bscan: entity work.bscan_controller
         generic map (
-            BSR_LENGTH => BSR_LENGTH,
-            IR_LENGTH => IR_LENGTH
+            MAX_DR_BITS => BSR_LENGTH,
+            MAX_IR_BITS => MAX_IR_BITS
         )
         port map (
             clk => clk,
             rst_n => rst_n_int,
             req_valid => bscan_req_valid,
-            req_op => bscan_req_op,
+            req_kind => bscan_req_kind,
+            req_ir_len => bscan_req_ir_len,
+            req_sample_ir => bscan_req_sample_ir,
+            req_extest_ir => bscan_req_extest_ir,
+            req_dr_len => bscan_req_dr_len,
             req_pin_num => bscan_req_pin_num,
             req_pin_val => bscan_req_pin_val,
-            req_bsr_data => bscan_req_data,
+            req_dr_data => bscan_req_data,
             busy => bscan_busy,
             done => bscan_done,
-            rsp_bsr_data => bscan_rsp_data,
+            rsp_dr_data => bscan_rsp_data,
             rsp_pin_val => bscan_rsp_pin,
             jtag_req_valid => bscan_jtag_req_valid,
             jtag_req_kind => bscan_jtag_req_kind,
-            jtag_req_ir => bscan_jtag_req_ir,
+            jtag_req_ir_len => bscan_jtag_req_ir_len,
+            jtag_req_ir_data => bscan_jtag_req_ir,
             jtag_req_dr_len => bscan_jtag_req_dr_len,
             jtag_req_dr_data => bscan_jtag_req_data,
             jtag_busy => jtag_busy,
@@ -280,12 +301,17 @@ begin
                 resp_idx <= (others => '0');
                 resp_last_byte <= '0';
                 raw_jtag_req_kind <= JTAG_REQ_NONE;
+                raw_jtag_req_ir_len <= (others => '0');
                 raw_jtag_req_ir <= (others => '0');
                 raw_jtag_req_dr_len <= (others => '0');
                 raw_jtag_req_dr_data <= (others => '0');
                 raw_jtag_req_tms <= '0';
                 raw_jtag_req_edges <= (others => '0');
-                bscan_req_op <= (others => '0');
+                bscan_req_kind <= BSCAN_REQ_NONE;
+                bscan_req_ir_len <= (others => '0');
+                bscan_req_sample_ir <= (others => '0');
+                bscan_req_extest_ir <= (others => '0');
+                bscan_req_dr_len <= (others => '0');
                 bscan_req_pin_num <= (others => '0');
                 bscan_req_pin_val <= '0';
                 bscan_req_data <= (others => '0');
@@ -323,6 +349,7 @@ begin
 
                                 when HOST_REQ_DEBUG_SET_TMS =>
                                     raw_jtag_req_kind <= JTAG_REQ_SET_TMS;
+                                    raw_jtag_req_ir_len <= (others => '0');
                                     raw_jtag_req_ir <= (others => '0');
                                     raw_jtag_req_dr_len <= (others => '0');
                                     raw_jtag_req_dr_data <= (others => '0');
@@ -333,6 +360,7 @@ begin
 
                                 when HOST_REQ_DEBUG_TOGGLE_TCK =>
                                     raw_jtag_req_kind <= JTAG_REQ_TOGGLE_TCK;
+                                    raw_jtag_req_ir_len <= (others => '0');
                                     raw_jtag_req_ir <= (others => '0');
                                     raw_jtag_req_dr_len <= (others => '0');
                                     raw_jtag_req_dr_data <= (others => '0');
@@ -343,6 +371,7 @@ begin
 
                                 when HOST_REQ_RAW_JTAG_RESET =>
                                     raw_jtag_req_kind <= JTAG_REQ_RESET;
+                                    raw_jtag_req_ir_len <= (others => '0');
                                     raw_jtag_req_ir <= (others => '0');
                                     raw_jtag_req_dr_len <= (others => '0');
                                     raw_jtag_req_dr_data <= (others => '0');
@@ -351,9 +380,10 @@ begin
                                     raw_jtag_req_valid <= '1';
                                     state <= ST_WAIT_JTAG;
 
-                                when HOST_REQ_RAW_JTAG_LOAD_IR =>
+                                when HOST_REQ_RAW_JTAG_SHIFT_IR =>
                                     raw_jtag_req_kind <= JTAG_REQ_SHIFT_IR;
-                                    raw_jtag_req_ir <= parser_req_byte;
+                                    raw_jtag_req_ir_len <= parser_req_ir_len;
+                                    raw_jtag_req_ir <= parser_req_ir_data;
                                     raw_jtag_req_dr_len <= (others => '0');
                                     raw_jtag_req_dr_data <= (others => '0');
                                     raw_jtag_req_tms <= '0';
@@ -363,9 +393,21 @@ begin
 
                                 when HOST_REQ_RAW_JTAG_SHIFT_DR =>
                                     raw_jtag_req_kind <= JTAG_REQ_SHIFT_DR;
+                                    raw_jtag_req_ir_len <= (others => '0');
                                     raw_jtag_req_ir <= (others => '0');
-                                    raw_jtag_req_dr_len <= parser_req_len;
-                                    raw_jtag_req_dr_data <= parser_req_data;
+                                    raw_jtag_req_dr_len <= parser_req_dr_len;
+                                    raw_jtag_req_dr_data <= parser_req_dr_data;
+                                    raw_jtag_req_tms <= '0';
+                                    raw_jtag_req_edges <= (others => '0');
+                                    raw_jtag_req_valid <= '1';
+                                    state <= ST_WAIT_JTAG;
+
+                                when HOST_REQ_RAW_JTAG_SHIFT_IR_DR =>
+                                    raw_jtag_req_kind <= JTAG_REQ_SHIFT_IR_DR;
+                                    raw_jtag_req_ir_len <= parser_req_ir_len;
+                                    raw_jtag_req_ir <= parser_req_ir_data;
+                                    raw_jtag_req_dr_len <= parser_req_dr_len;
+                                    raw_jtag_req_dr_data <= parser_req_dr_data;
                                     raw_jtag_req_tms <= '0';
                                     raw_jtag_req_edges <= (others => '0');
                                     raw_jtag_req_valid <= '1';
@@ -373,7 +415,9 @@ begin
 
                                 when HOST_REQ_RAW_IDCODE =>
                                     raw_jtag_req_kind <= JTAG_REQ_SHIFT_IR_DR;
-                                    raw_jtag_req_ir <= JTAG_IDCODE;
+                                    raw_jtag_req_ir_len <= to_unsigned(8, 16);
+                                    raw_jtag_req_ir <= (others => '0');
+                                    raw_jtag_req_ir(7 downto 0) <= x"02";
                                     raw_jtag_req_dr_len <= to_unsigned(32, 16);
                                     raw_jtag_req_dr_data <= (others => '0');
                                     raw_jtag_req_tms <= '0';
@@ -382,7 +426,12 @@ begin
                                     state <= ST_WAIT_JTAG;
 
                                 when HOST_REQ_BSCAN_SAMPLE =>
-                                    bscan_req_op <= BSCAN_OP_SAMPLE;
+                                    bscan_req_kind <= BSCAN_REQ_SAMPLE;
+                                    bscan_req_ir_len <= to_unsigned(IR_LENGTH, 16);
+                                    bscan_req_sample_ir <= (others => '0');
+                                    bscan_req_sample_ir(7 downto 0) <= x"05";
+                                    bscan_req_extest_ir <= (others => '0');
+                                    bscan_req_dr_len <= to_unsigned(BSR_LENGTH, 16);
                                     bscan_req_pin_num <= (others => '0');
                                     bscan_req_pin_val <= '0';
                                     bscan_req_data <= (others => '0');
@@ -390,28 +439,99 @@ begin
                                     state <= ST_WAIT_BSCAN;
 
                                 when HOST_REQ_BSCAN_LOAD =>
-                                    bscan_req_op <= BSCAN_OP_LOAD;
+                                    bscan_req_kind <= BSCAN_REQ_LOAD;
+                                    bscan_req_ir_len <= to_unsigned(IR_LENGTH, 16);
+                                    bscan_req_sample_ir <= (others => '0');
+                                    bscan_req_extest_ir <= (others => '0');
+                                    bscan_req_extest_ir(7 downto 0) <= x"00";
+                                    bscan_req_dr_len <= parser_req_dr_len;
                                     bscan_req_pin_num <= (others => '0');
                                     bscan_req_pin_val <= '0';
-                                    bscan_req_data <= parser_req_data;
+                                    bscan_req_data <= parser_req_dr_data;
                                     bscan_req_valid <= '1';
                                     state <= ST_WAIT_BSCAN;
 
                                 when HOST_REQ_BSCAN_SET_PIN =>
-                                    bscan_req_op <= BSCAN_OP_SET_PIN;
-                                    bscan_req_pin_num <= parser_req_word;
-                                    bscan_req_pin_val <= parser_req_byte(0);
+                                    bscan_req_kind <= BSCAN_REQ_SET_PIN;
+                                    bscan_req_ir_len <= to_unsigned(IR_LENGTH, 16);
+                                    bscan_req_sample_ir <= (others => '0');
+                                    bscan_req_extest_ir <= (others => '0');
+                                    bscan_req_extest_ir(7 downto 0) <= x"00";
+                                    bscan_req_dr_len <= to_unsigned(BSR_LENGTH, 16);
+                                    bscan_req_pin_num <= parser_req_pin_num;
+                                    bscan_req_pin_val <= parser_req_pin_val;
                                     bscan_req_data <= (others => '0');
                                     bscan_req_valid <= '1';
                                     state <= ST_WAIT_BSCAN;
 
                                 when HOST_REQ_BSCAN_READ_PIN =>
-                                    bscan_req_op <= BSCAN_OP_READ;
-                                    bscan_req_pin_num <= parser_req_word;
+                                    bscan_req_kind <= BSCAN_REQ_READ_PIN;
+                                    bscan_req_ir_len <= to_unsigned(IR_LENGTH, 16);
+                                    bscan_req_sample_ir <= (others => '0');
+                                    bscan_req_sample_ir(7 downto 0) <= x"05";
+                                    bscan_req_extest_ir <= (others => '0');
+                                    bscan_req_dr_len <= to_unsigned(BSR_LENGTH, 16);
+                                    bscan_req_pin_num <= parser_req_pin_num;
                                     bscan_req_pin_val <= '0';
                                     bscan_req_data <= (others => '0');
                                     bscan_req_valid <= '1';
                                     state <= ST_WAIT_BSCAN;
+
+                                when HOST_REQ_BSCAN_SAMPLE_EX =>
+                                    bscan_req_kind <= BSCAN_REQ_SAMPLE;
+                                    bscan_req_ir_len <= parser_req_ir_len;
+                                    bscan_req_sample_ir <= parser_req_ir_data;
+                                    bscan_req_extest_ir <= (others => '0');
+                                    bscan_req_dr_len <= parser_req_dr_len;
+                                    bscan_req_pin_num <= (others => '0');
+                                    bscan_req_pin_val <= '0';
+                                    bscan_req_data <= (others => '0');
+                                    bscan_req_valid <= '1';
+                                    state <= ST_WAIT_BSCAN;
+
+                                when HOST_REQ_BSCAN_LOAD_EX =>
+                                    bscan_req_kind <= BSCAN_REQ_LOAD;
+                                    bscan_req_ir_len <= parser_req_ir_len;
+                                    bscan_req_sample_ir <= (others => '0');
+                                    bscan_req_extest_ir <= parser_req_ir_data;
+                                    bscan_req_dr_len <= parser_req_dr_len;
+                                    bscan_req_pin_num <= (others => '0');
+                                    bscan_req_pin_val <= '0';
+                                    bscan_req_data <= parser_req_dr_data;
+                                    bscan_req_valid <= '1';
+                                    state <= ST_WAIT_BSCAN;
+
+                                when HOST_REQ_BSCAN_SET_PIN_EX =>
+                                    bscan_req_kind <= BSCAN_REQ_SET_PIN;
+                                    bscan_req_ir_len <= parser_req_ir_len;
+                                    bscan_req_sample_ir <= (others => '0');
+                                    bscan_req_extest_ir <= parser_req_ir_data;
+                                    bscan_req_dr_len <= parser_req_dr_len;
+                                    bscan_req_pin_num <= parser_req_pin_num;
+                                    bscan_req_pin_val <= parser_req_pin_val;
+                                    bscan_req_data <= (others => '0');
+                                    bscan_req_valid <= '1';
+                                    state <= ST_WAIT_BSCAN;
+
+                                when HOST_REQ_BSCAN_READ_PIN_EX =>
+                                    bscan_req_kind <= BSCAN_REQ_READ_PIN;
+                                    bscan_req_ir_len <= parser_req_ir_len;
+                                    bscan_req_sample_ir <= parser_req_ir_data;
+                                    bscan_req_extest_ir <= (others => '0');
+                                    bscan_req_dr_len <= parser_req_dr_len;
+                                    bscan_req_pin_num <= parser_req_pin_num;
+                                    bscan_req_pin_val <= '0';
+                                    bscan_req_data <= (others => '0');
+                                    bscan_req_valid <= '1';
+                                    state <= ST_WAIT_BSCAN;
+
+                                when HOST_REQ_CHAIN_CFG =>
+                                    resp_buf <= (others => '0');
+                                    resp_buf(7 downto 0) <= x"00";
+                                    resp_len <= to_unsigned(1, resp_len'length);
+                                    resp_idx <= (others => '0');
+                                    resp_last_byte <= '0';
+                                    state <= ST_SEND_RESPONSE;
 
                                 when HOST_REQ_I2C_WRITE =>
                                     resp_buf <= (others => '0');
@@ -459,6 +579,9 @@ begin
                                 when HOST_REQ_RAW_JTAG_SHIFT_DR =>
                                     resp_buf(BSR_LENGTH-1 downto 0) <= jtag_rsp_data;
                                     resp_len <= to_unsigned(bytes_for_bits(to_integer(jtag_rsp_len)), resp_len'length);
+                                when HOST_REQ_RAW_JTAG_SHIFT_IR_DR =>
+                                    resp_buf(BSR_LENGTH-1 downto 0) <= jtag_rsp_data;
+                                    resp_len <= to_unsigned(bytes_for_bits(to_integer(jtag_rsp_len)), resp_len'length);
                                 when HOST_REQ_RAW_IDCODE =>
                                     resp_buf(BSR_LENGTH-1 downto 0) <= jtag_rsp_data;
                                     resp_len <= to_unsigned(4, resp_len'length);
@@ -477,12 +600,12 @@ begin
                             resp_last_byte <= '0';
 
                             case active_req_kind is
-                                when HOST_REQ_BSCAN_READ_PIN =>
+                                when HOST_REQ_BSCAN_READ_PIN | HOST_REQ_BSCAN_READ_PIN_EX =>
                                     resp_buf(0) <= bscan_rsp_pin;
                                     resp_len <= to_unsigned(1, resp_len'length);
                                 when others =>
                                     resp_buf(BSR_LENGTH-1 downto 0) <= bscan_rsp_data;
-                                    resp_len <= to_unsigned(bytes_for_bits(BSR_LENGTH), resp_len'length);
+                                    resp_len <= to_unsigned(bytes_for_bits(to_integer(bscan_req_dr_len)), resp_len'length);
                             end case;
 
                             state <= ST_SEND_RESPONSE;

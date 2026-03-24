@@ -1,0 +1,17 @@
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\bin\Debug\net8.0-windows\I2CJtagEngine.exe
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\bin\Debug\net8.0-windows\I2CJtagEngine.deps.json
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\bin\Debug\net8.0-windows\I2CJtagEngine.runtimeconfig.json
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\bin\Debug\net8.0-windows\I2CJtagEngine.dll
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\bin\Debug\net8.0-windows\I2CJtagEngine.pdb
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\bin\Debug\net8.0-windows\FTD2XX_NET.dll
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.csproj.AssemblyReference.cache
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.AssemblyInfoInputs.cache
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.AssemblyInfo.cs
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.csproj.CoreCompileInputs.cache
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagE.57B35C9A.Up2Date
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.dll
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\refint\I2CJtagEngine.dll
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.pdb
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\I2CJtagEngine.genruntimeconfig.cache
+C:\Users\SEDAKLE\Downloads\I2C_JTAG_Engine\I2C_JTAG_Engine\software\obj\Debug\net8.0-windows\ref\I2CJtagEngine.dll

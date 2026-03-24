@@ -1,0 +1,41 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "I2CJtagEngine/1.0.0": {
+        "dependencies": {
+          "FTD2XX_NET": "1.0.14"
+        },
+        "runtime": {
+          "I2CJtagEngine.dll": {}
+        }
+      },
+      "FTD2XX_NET/1.0.14": {
+        "runtime": {
+          "lib/net40/FTD2XX_NET.dll": {
+            "assemblyVersion": "1.0.14.39395",
+            "fileVersion": "1.0.14.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "I2CJtagEngine/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "FTD2XX_NET/1.0.14": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-6q0G72pfCyUzX41H9f2X9OYwWzVC+++G5MtWsSnmzORBpQF/9Sz3jjpIeTqoaMMz2oLZkvCTHZcUisiOZMnExQ==",
+      "path": "ftd2xx_net/1.0.14",
+      "hashPath": "ftd2xx_net.1.0.14.nupkg.sha512"
+    }
+  }
+}

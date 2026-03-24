@@ -1,0 +1,2482 @@
+I got this vhdl code for a work in progress jtag boundary scan controller. basically it should receive commands from a pc application telling it what type of boundary scan tests it wants to perform and based on that it should produce the jtag data stream and clock that out on a jtag interface that a DUT is connected to. its not complete and its only in on vhd file which is quite cumbersome. to start with i want you to give me your understanding of the code and then give me a suggestion on how we could break it down into several files to make it more managable. see the code in the attached .vhd file.
+Thought for 41s
+
+I don’t currently have the .vhd file in the workspace, so I can’t inspect the code itself yet.
+
+Once you upload or paste it, I’ll do two things:
+
+give you a plain-language walkthrough of what the current code is doing, including the likely command flow from PC interface to TAP/JTAG output
+propose a clean file/module split so it’s easier to maintain and extend
+
+For this kind of design, a sensible end-state is usually something like:
+
+jtag_pkg.vhd
+Shared types, constants, enums, command definitions, TAP state type, instruction codes.
+jtag_tap_fsm.vhd
+The low-level TAP controller state machine: Test-Logic-Reset, Run-Test/Idle, Shift-IR, Shift-DR, etc.
+jtag_shift_engine.vhd
+Handles bit shifting on TDI/TDO, TCK generation, bit counters, end-of-shift control.
+boundary_scan_cmd_decoder.vhd
+Decodes commands from the PC-side interface into internal operations like EXTEST, SAMPLE/PRELOAD, BYPASS, IDCODE, custom scan sequences.
+boundary_scan_sequence_ctrl.vhd
+Higher-level sequencer that decides which TAP transitions and scan operations to run for each requested test.
+pc_command_if.vhd
+The host-facing interface layer, whatever that is in your design today: UART/SPI/FIFO/register interface.
+jtag_top.vhd
+Top-level integration of command interface, sequencer, TAP FSM, and physical JTAG pins.
+
+If your current file mixes all of these concerns together, that is probably why it feels cumbersome: command parsing, protocol sequencing, and pin-level timing are different abstraction levels and are much easier to reason about when separated.
+
+Upload the VHDL file and I’ll go through the actual code structure in detail.
+
+ok, i uploaded it to the project as txt instead. try again.
+Thought for 22s
+
+I still can’t access the code file from this chat session.
+
+I checked the available uploaded files and there isn’t a readable .txt or .vhd file present on my side right now, so I can’t honestly give you a code-specific walkthrough yet.
+
+Please do one of these:
+
+paste the VHDL here directly, or
+upload the .txt again in the chat so it’s attached to this conversation
+
+As soon as it’s visible, I’ll give you:
+
+a structured explanation of what the current design does
+a proposed split into multiple VHDL files
+a suggested top-level hierarchy for the boundary scan controller
+notes on which parts should stay combinational, sequential, or package-only
+ok, here it is:
+
+-------------------------------------------------------------------------------
+-- I2C over JTAG Engine - Full Implementation v2
+-- Complete boundary scan and I2C control
+--
+-- JTAG Commands:
+--   0x10                 - JTAG Reset (5x TMS=1)
+--   0x11                 - Read IDCODE (returns 4 bytes)
+--   0x12 <ir_byte>       - Load IR instruction
+--   0x13 <len_lo> <len_hi> <data...> - Shift DR (returns shifted data)
+--
+-- Boundary Scan Commands:
+--   0x14                 - Sample BSR (returns BSR_LEN/8 bytes)
+--   0x15 <data...>       - Load BSR with EXTEST (BSR_LEN/8 bytes)
+--   0x16 <bit_lo> <bit_hi> <val> - Set single pin
+--   0x17 <bit_lo> <bit_hi>       - Read single pin (returns 1 byte)
+--
+-- I2C Commands:
+--   0x20 <addr> <len> <data...>         - I2C Write
+--   0x21 <addr> <len>                   - I2C Read
+--   0x22 <addr> <wlen> <rlen> <data...> - I2C Write then Read
+--   0x23                                - I2C Bus Scan (returns 16 bytes bitmap)
+--
+-- Utility:
+--   0x40 <val>           - LED control
+--   0xFF                 - Ping (returns 0x55)
+-------------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity loopback_test is
+    generic (
+        -- Boundary Scan Register config (from BSDL)
+        BSR_LENGTH      : natural := 362;
+        IR_LENGTH       : natural := 4;
+        
+        -- I2C pin positions in BSR (directly directly adjust per your target!)
+        -- These are typical positions - update from your BSDL
+        SDA_OUT_BIT     : natural := 10;   -- SDA output data bit
+        SDA_OE_BIT      : natural := 11;   -- SDA output enable (active high = drive)
+        SDA_IN_BIT      : natural := 9;    -- SDA input bit
+        SCL_OUT_BIT     : natural := 14;   -- SCL output data bit  
+        SCL_OE_BIT      : natural := 15    -- SCL output enable
+    );
+    port (
+        ft_data         : inout std_logic_vector(7 downto 0);
+        ft_rxf_n        : in    std_logic;
+        ft_txe_n        : in    std_logic;
+        ft_rd_n         : out   std_logic;
+        ft_wr_n         : out   std_logic;
+        ft_siwu_n       : out   std_logic;
+        jtag_tck        : out   std_logic;
+        jtag_tms        : out   std_logic;
+        jtag_tdi        : out   std_logic;
+        jtag_tdo        : in    std_logic;
+        led             : out   std_logic_vector(1 downto 0)
+    );
+end entity;
+
+architecture rtl of loopback_test is
+
+    -- JTAG Instructions (Lattice Certus-NX defaults)
+    constant JTAG_EXTEST    : std_logic_vector(7 downto 0) := x"00";
+    constant JTAG_SAMPLE    : std_logic_vector(7 downto 0) := x"05";
+    constant JTAG_IDCODE    : std_logic_vector(7 downto 0) := x"02";
+    constant JTAG_BYPASS    : std_logic_vector(7 downto 0) := x"0F";
+    
+    -- I2C Timing (in clock cycles at ~56 MHz)
+    constant I2C_QUARTER    : natural := 140;  -- ~2.5us (100kHz I2C)
+    
+    -- Calculate BSR byte length
+    constant BSR_BYTES      : natural := (BSR_LENGTH + 7) / 8;  -- 46 bytes for 362 bits
+
+    component OSCA
+        generic (HF_CLK_DIV : string := "8");
+        port (
+            HFOUTEN  : in  std_logic;
+            HFSDSCEN : in  std_logic;
+            HFCLKOUT : out std_logic
+        );
+    end component;
+
+    -- Clock and reset
+    signal clk          : std_logic;
+    signal rst_cnt      : unsigned(7 downto 0) := (others => '0');
+    signal rst_done     : std_logic := '0';
+    signal rst_n        : std_logic := '0';
+    signal hb_cnt       : unsigned(25 downto 0) := (others => '0');
+    
+    -- FT2232H interface
+    signal ft_data_out  : std_logic_vector(7 downto 0) := (others => '0');
+    signal ft_data_oe   : std_logic := '0';
+    signal rxf_sync     : std_logic_vector(2 downto 0) := (others => '1');
+    signal txe_sync     : std_logic_vector(2 downto 0) := (others => '1');
+    signal rxf_n        : std_logic;
+    signal txe_n        : std_logic;
+
+    -- Main state machine
+    type main_state_t is (
+        -- FIFO states
+        IDLE, READ_PULSE, READ_CAPTURE, READ_DONE,
+        WRITE_SETUP, WRITE_PULSE, WRITE_DONE,
+        -- Command processing
+        PROCESS_CMD, WAIT_MORE_DATA,
+        -- JTAG low-level
+        JTAG_RESET_RUN,
+        JTAG_GOTO_SHIFT_IR, JTAG_SHIFT_IR, JTAG_EXIT_IR,
+        JTAG_GOTO_SHIFT_DR, JTAG_SHIFT_DR, JTAG_EXIT_DR,
+        JTAG_GOTO_IDLE,
+        -- Response handling
+        SEND_RESPONSE_BYTE, NEXT_RESPONSE_BYTE,
+		
+		DEBUG_TCK_TOGGLE
+    );
+    signal state        : main_state_t := IDLE;
+    signal return_state : main_state_t := IDLE;
+    signal next_state   : main_state_t := IDLE;
+    
+    signal wait_cnt     : unsigned(15 downto 0) := (others => '0');
+    
+    -- Command parsing
+    signal cmd_byte     : std_logic_vector(7 downto 0) := (others => '0');
+    signal rx_byte      : std_logic_vector(7 downto 0) := (others => '0');
+    signal param_cnt    : unsigned(7 downto 0) := (others => '0');
+    signal param_need   : unsigned(7 downto 0) := (others => '0');
+    
+    -- TX handling
+    signal tx_byte      : std_logic_vector(7 downto 0) := (others => '0');
+    signal have_tx      : std_logic := '0';
+    
+    -- LED
+    signal led_reg      : std_logic_vector(1 downto 0) := "00";
+    
+    -- JTAG signals
+    signal tck_reg      : std_logic := '0';
+    signal tms_reg      : std_logic := '1';
+    signal tdi_reg      : std_logic := '0';
+    signal tdo_sample   : std_logic := '0';
+    signal jtag_cnt     : unsigned(15 downto 0) := (others => '0');
+    signal jtag_div     : unsigned(7 downto 0) := (others => '0');
+    constant JTAG_DIV_MAX : unsigned(7 downto 0) := to_unsigned(255, 8);
+    
+    -- JTAG data shift register
+    signal shift_reg    : std_logic_vector(BSR_LENGTH-1 downto 0) := (others => '0');
+    signal shift_len    : unsigned(15 downto 0) := (others => '0');
+    signal shift_cnt    : unsigned(15 downto 0) := (others => '0');
+    signal ir_value     : std_logic_vector(7 downto 0) := (others => '1');
+    
+    -- Response buffer
+    signal resp_buf     : std_logic_vector(BSR_LENGTH-1 downto 0) := (others => '0');
+    signal resp_len     : unsigned(7 downto 0) := (others => '0');
+    signal resp_idx     : unsigned(7 downto 0) := (others => '0');
+    
+    -- I2C command parameters
+    signal i2c_addr     : std_logic_vector(6 downto 0) := (others => '0');
+    signal i2c_wr_len   : unsigned(7 downto 0) := (others => '0');
+    signal i2c_rd_len   : unsigned(7 downto 0) := (others => '0');
+    signal i2c_data_buf : std_logic_vector(255 downto 0) := (others => '0');
+    signal i2c_byte_idx : unsigned(7 downto 0) := (others => '0');
+    signal i2c_bit_idx  : unsigned(3 downto 0) := (others => '0');
+    
+    -- Boundary scan register (active copy)
+    signal bsr_data     : std_logic_vector(BSR_LENGTH-1 downto 0) := (others => '0');
+    signal bsr_capture  : std_logic_vector(BSR_LENGTH-1 downto 0) := (others => '0');
+    
+    -- Single pin access
+    signal pin_num      : unsigned(15 downto 0) := (others => '0');
+    signal pin_val      : std_logic := '0';
+    
+    -- DR shift length for commands
+    signal dr_len       : unsigned(15 downto 0) := (others => '0');
+    
+    -- I2C internal signals
+    signal i2c_sda_out  : std_logic := '1';
+    signal i2c_scl_out  : std_logic := '1';
+    signal i2c_sda_in   : std_logic := '1';
+    signal i2c_state    : unsigned(3 downto 0) := (others => '0');
+    signal i2c_phase    : unsigned(1 downto 0) := (others => '0');
+    signal i2c_timer    : unsigned(15 downto 0) := (others => '0');
+    signal i2c_cur_byte : std_logic_vector(7 downto 0) := (others => '0');
+    signal i2c_ack_bit  : std_logic := '0';
+    signal i2c_nack     : std_logic := '0';
+    signal i2c_scan_addr: unsigned(6 downto 0) := (others => '0');
+    signal i2c_scan_map : std_logic_vector(127 downto 0) := (others => '0');
+    
+    -- I2C state constants
+    constant I2C_IDLE       : unsigned(3 downto 0) := x"0";
+    constant I2C_START      : unsigned(3 downto 0) := x"1";
+    constant I2C_SEND_ADDR  : unsigned(3 downto 0) := x"2";
+    constant I2C_GET_ACK    : unsigned(3 downto 0) := x"3";
+    constant I2C_WRITE_BYTE : unsigned(3 downto 0) := x"4";
+    constant I2C_WRITE_ACK  : unsigned(3 downto 0) := x"5";
+    constant I2C_READ_BYTE  : unsigned(3 downto 0) := x"6";
+    constant I2C_SEND_ACK   : unsigned(3 downto 0) := x"7";
+    constant I2C_STOP       : unsigned(3 downto 0) := x"8";
+    constant I2C_RESTART    : unsigned(3 downto 0) := x"9";
+    constant I2C_DONE       : unsigned(3 downto 0) := x"A";
+
+begin
+
+    -- Output assignments
+    ft_siwu_n <= '0';
+    ft_data   <= ft_data_out when ft_data_oe = '1' else (others => 'Z');
+    jtag_tck  <= tck_reg;
+    jtag_tms  <= tms_reg;
+    jtag_tdi  <= tdi_reg;
+    
+    -- LED control
+    led(0) <= hb_cnt(24) when led_reg(0) = '0' else '1';
+    led(1) <= led_reg(1);
+    
+    rxf_n <= rxf_sync(2);
+    txe_n <= txe_sync(2);
+
+    -- Oscillator
+    u_osc: OSCA
+        generic map (HF_CLK_DIV => "8")
+        port map (HFOUTEN => '1', HFSDSCEN => '0', HFCLKOUT => clk);
+
+    -- Reset and sync process
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_done = '0' then
+                if rst_cnt = 255 then rst_done <= '1';
+                else rst_cnt <= rst_cnt + 1; end if;
+            end if;
+            rst_n <= rst_done;
+            hb_cnt <= hb_cnt + 1;
+            rxf_sync <= rxf_sync(1 downto 0) & ft_rxf_n;
+            txe_sync <= txe_sync(1 downto 0) & ft_txe_n;
+        end if;
+    end process;
+
+    ---------------------------------------------------------------------------
+    -- Main State Machine
+    ---------------------------------------------------------------------------
+    process(clk)
+        variable byte_idx : integer;
+        variable bit_idx  : integer;
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                state <= IDLE;
+                ft_rd_n <= '1'; ft_wr_n <= '1'; ft_data_oe <= '0';
+                have_tx <= '0'; led_reg <= "00";
+                tck_reg <= '0'; tms_reg <= '1'; tdi_reg <= '0';
+                cmd_byte <= x"00";
+                wait_cnt <= (others => '0');
+                jtag_div <= (others => '0');
+            else
+                -- JTAG clock divider
+                if jtag_div /= 0 then
+                    jtag_div <= jtag_div - 1;
+                end if;
+                
+                case state is
+                
+                    --------------------------------------------------------
+                    -- FIFO IDLE
+                    --------------------------------------------------------
+                    when IDLE =>
+                        ft_rd_n <= '1'; ft_wr_n <= '1'; ft_data_oe <= '0';
+                        
+                        if have_tx = '1' and txe_n = '0' then
+                            ft_data_out <= tx_byte;
+                            ft_data_oe <= '1';
+                            wait_cnt <= to_unsigned(2, 16);
+                            state <= WRITE_SETUP;
+                        elsif rxf_n = '0' then
+                            ft_rd_n <= '0';
+                            wait_cnt <= to_unsigned(3, 16);
+                            state <= READ_PULSE;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- FIFO READ
+                    --------------------------------------------------------
+                    when READ_PULSE =>
+                        if wait_cnt = 0 then state <= READ_CAPTURE;
+                        else wait_cnt <= wait_cnt - 1; end if;
+                        
+                    when READ_CAPTURE =>
+                        rx_byte <= ft_data;
+                        ft_rd_n <= '1';
+                        wait_cnt <= to_unsigned(2, 16);
+                        state <= READ_DONE;
+                        
+                    when READ_DONE =>
+                        if wait_cnt = 0 then state <= PROCESS_CMD;
+                        else wait_cnt <= wait_cnt - 1; end if;
+                        
+                    --------------------------------------------------------
+                    -- FIFO WRITE
+                    --------------------------------------------------------
+                    when WRITE_SETUP =>
+                        if wait_cnt = 0 then
+                            ft_wr_n <= '0';
+                            wait_cnt <= to_unsigned(3, 16);
+                            state <= WRITE_PULSE;
+                        else wait_cnt <= wait_cnt - 1; end if;
+                        
+                    when WRITE_PULSE =>
+                        if wait_cnt = 0 then
+                            ft_wr_n <= '1';
+                            have_tx <= '0';
+                            wait_cnt <= to_unsigned(2, 16);
+                            state <= WRITE_DONE;
+                        else wait_cnt <= wait_cnt - 1; end if;
+                        
+                    when WRITE_DONE =>
+                        ft_data_oe <= '0';
+                        if wait_cnt = 0 then state <= return_state;
+                        else wait_cnt <= wait_cnt - 1; end if;
+                        
+                    --------------------------------------------------------
+                    -- COMMAND PROCESSING
+                    --------------------------------------------------------
+                    when PROCESS_CMD =>
+                        if cmd_byte = x"00" then
+                            -- New command
+                            cmd_byte <= rx_byte;
+                            param_cnt <= (others => '0');
+                            
+                            case rx_byte is
+                                -- Single-byte commands (immediate response)
+                                when x"FF" =>  -- Ping
+                                    tx_byte <= x"55";
+                                    have_tx <= '1';
+                                    return_state <= IDLE;
+                                    cmd_byte <= x"00";
+                                    state <= IDLE;
+									
+								when x"18" =>  -- Read raw TDO pin state
+									tx_byte <= "0000000" & jtag_tdo;  -- TDO as LSB
+									have_tx <= '1';
+									return_state <= IDLE;
+									cmd_byte <= x"00";
+									state <= IDLE;
+                                   
+								   when x"19" =>  -- Toggle TCK 10 times (for scope/logic analyzer)
+										jtag_cnt <= to_unsigned(20, 16);  -- 20 edges = 10 pulses
+										jtag_div <= JTAG_DIV_MAX;
+										state <= DEBUG_TCK_TOGGLE;
+										cmd_byte <= x"00";
+
+									when x"1A" =>  -- Set TMS high
+										tms_reg <= '1';
+										tx_byte <= x"00";
+										have_tx <= '1';
+										return_state <= IDLE;
+										cmd_byte <= x"00";
+										state <= IDLE;
+
+									when x"1B" =>  -- Set TMS low
+										tms_reg <= '0';
+										tx_byte <= x"00";
+										have_tx <= '1';
+										return_state <= IDLE;
+										cmd_byte <= x"00";
+										state <= IDLE;
+										
+									when x"10" =>  -- JTAG Reset
+                                    jtag_cnt <= to_unsigned(10, 16);
+                                    tms_reg <= '1';
+                                    jtag_div <= JTAG_DIV_MAX;
+                                    state <= JTAG_RESET_RUN;
+                                    cmd_byte <= x"00";
+                                    
+                                when x"11" =>  -- Read IDCODE
+                                    ir_value <= JTAG_IDCODE;
+                                    dr_len <= to_unsigned(32, 16);
+                                    shift_reg <= (others => '0');
+                                    state <= JTAG_GOTO_SHIFT_IR;
+                                    next_state <= JTAG_GOTO_SHIFT_DR;
+                                    cmd_byte <= x"00";
+                                    
+                                when x"14" =>  -- Sample BSR
+                                    ir_value <= JTAG_SAMPLE;
+                                    dr_len <= to_unsigned(BSR_LENGTH, 16);
+                                    shift_reg <= (others => '0');
+                                    state <= JTAG_GOTO_SHIFT_IR;
+                                    next_state <= JTAG_GOTO_SHIFT_DR;
+                                    cmd_byte <= x"00";
+                                    
+                                -- Multi-byte commands (need more params)
+                                when x"40" =>  -- LED (need 1 byte)
+                                    param_need <= to_unsigned(1, 8);
+                                    state <= IDLE;
+                                    
+                                when x"12" =>  -- Load IR (need 1 byte)
+                                    param_need <= to_unsigned(1, 8);
+                                    state <= IDLE;
+                                    
+                                when x"13" =>  -- Shift DR (need 2 len bytes + data)
+                                    param_need <= to_unsigned(2, 8);
+                                    state <= IDLE;
+                                    
+                                when x"15" =>  -- Load BSR (need BSR_BYTES bytes)
+                                    param_need <= to_unsigned(BSR_BYTES, 8);
+                                    state <= IDLE;
+                                    
+                                when x"16" =>  -- Set pin (need 3 bytes)
+                                    param_need <= to_unsigned(3, 8);
+                                    state <= IDLE;
+                                    
+                                when x"17" =>  -- Read pin (need 2 bytes)
+                                    param_need <= to_unsigned(2, 8);
+                                    state <= IDLE;
+                                    
+                                when x"20" =>  -- I2C Write (need addr, len, data)
+                                    param_need <= to_unsigned(2, 8);
+                                    state <= IDLE;
+                                    
+                                when x"21" =>  -- I2C Read (need addr, len)
+                                    param_need <= to_unsigned(2, 8);
+                                    state <= IDLE;
+                                    
+                                when x"22" =>  -- I2C Write+Read (need addr, wlen, rlen, data)
+                                    param_need <= to_unsigned(3, 8);
+                                    state <= IDLE;
+                                    
+                                when x"23" =>  -- I2C Scan
+                                    -- Stub: return empty bitmap
+                                    resp_len <= to_unsigned(16, 8);
+                                    resp_idx <= (others => '0');
+                                    resp_buf <= (others => '0');
+                                    state <= SEND_RESPONSE_BYTE;
+                                    cmd_byte <= x"00";
+                                    
+                                when others =>
+                                    -- Unknown, echo back
+                                    tx_byte <= rx_byte;
+                                    have_tx <= '1';
+                                    return_state <= IDLE;
+                                    cmd_byte <= x"00";
+                                    state <= IDLE;
+                            end case;
+                            
+                        else
+                            -- Collecting parameters
+                            case cmd_byte is
+                                when x"40" =>  -- LED
+                                    led_reg <= rx_byte(1 downto 0);
+                                    tx_byte <= x"00";
+                                    have_tx <= '1';
+                                    return_state <= IDLE;
+                                    cmd_byte <= x"00";
+                                    state <= IDLE;
+                                    
+                                when x"12" =>  -- Load IR
+                                    ir_value <= rx_byte;
+                                    dr_len <= to_unsigned(0, 16);  -- No DR shift
+                                    state <= JTAG_GOTO_SHIFT_IR;
+                                    next_state <= JTAG_GOTO_IDLE;
+                                    cmd_byte <= x"00";
+                                    
+                                when x"13" =>  -- Shift DR
+                                    if param_cnt = 0 then
+                                        dr_len(7 downto 0) <= unsigned(rx_byte);
+                                        param_cnt <= param_cnt + 1;
+                                        state <= IDLE;
+                                    elsif param_cnt = 1 then
+                                        dr_len(15 downto 8) <= unsigned(rx_byte);
+                                        param_cnt <= param_cnt + 1;
+                                        -- Calculate bytes needed
+                                        param_need <= resize((unsigned(rx_byte) & dr_len(7 downto 0) + 7) / 8, 8);
+                                        shift_reg <= (others => '0');
+                                        state <= IDLE;
+                                    else
+                                        -- Collect data bytes
+                                        byte_idx := to_integer(param_cnt - 2);
+                                        shift_reg(byte_idx*8+7 downto byte_idx*8) <= rx_byte;
+                                        param_cnt <= param_cnt + 1;
+                                        if param_cnt - 1 >= param_need then
+                                            state <= JTAG_GOTO_SHIFT_DR;
+                                            next_state <= SEND_RESPONSE_BYTE;
+                                            cmd_byte <= x"00";
+                                        else
+                                            state <= IDLE;
+                                        end if;
+                                    end if;
+                                    
+                                when x"15" =>  -- Load BSR with EXTEST
+                                    byte_idx := to_integer(param_cnt);
+                                    bsr_data(byte_idx*8+7 downto byte_idx*8) <= rx_byte;
+                                    param_cnt <= param_cnt + 1;
+                                    if param_cnt + 1 >= param_need then
+                                        ir_value <= JTAG_EXTEST;
+                                        dr_len <= to_unsigned(BSR_LENGTH, 16);
+                                        shift_reg <= bsr_data;
+                                        state <= JTAG_GOTO_SHIFT_IR;
+                                        next_state <= JTAG_GOTO_SHIFT_DR;
+                                        cmd_byte <= x"00";
+                                    else
+                                        state <= IDLE;
+                                    end if;
+                                    
+                                when x"16" =>  -- Set pin
+                                    if param_cnt = 0 then
+                                        pin_num(7 downto 0) <= unsigned(rx_byte);
+                                        param_cnt <= param_cnt + 1;
+                                        state <= IDLE;
+                                    elsif param_cnt = 1 then
+                                        pin_num(15 downto 8) <= unsigned(rx_byte);
+                                        param_cnt <= param_cnt + 1;
+                                        state <= IDLE;
+                                    else
+                                        -- Set pin in BSR
+                                        pin_val <= rx_byte(0);
+                                        if pin_num < BSR_LENGTH then
+                                            bsr_data(to_integer(pin_num)) <= rx_byte(0);
+                                        end if;
+                                        -- Shift out with EXTEST
+                                        ir_value <= JTAG_EXTEST;
+                                        dr_len <= to_unsigned(BSR_LENGTH, 16);
+                                        shift_reg <= bsr_data;
+                                        state <= JTAG_GOTO_SHIFT_IR;
+                                        next_state <= JTAG_GOTO_SHIFT_DR;
+                                        cmd_byte <= x"00";
+                                    end if;
+                                    
+                                when x"17" =>  -- Read pin
+                                    if param_cnt = 0 then
+                                        pin_num(7 downto 0) <= unsigned(rx_byte);
+                                        param_cnt <= param_cnt + 1;
+                                        state <= IDLE;
+                                    else
+                                        pin_num(15 downto 8) <= unsigned(rx_byte);
+                                        -- Sample BSR to read pin
+                                        ir_value <= JTAG_SAMPLE;
+                                        dr_len <= to_unsigned(BSR_LENGTH, 16);
+                                        shift_reg <= (others => '0');
+                                        state <= JTAG_GOTO_SHIFT_IR;
+                                        next_state <= JTAG_GOTO_SHIFT_DR;
+                                        cmd_byte <= x"17";  -- Keep cmd to return pin value
+                                    end if;
+                                    
+                                when x"20" | x"21" | x"22" =>  -- I2C commands
+                                    if param_cnt = 0 then
+                                        i2c_addr <= rx_byte(6 downto 0);
+                                        param_cnt <= param_cnt + 1;
+                                        state <= IDLE;
+                                    elsif param_cnt = 1 then
+                                        if cmd_byte = x"21" then
+                                            i2c_rd_len <= unsigned(rx_byte);
+                                            i2c_wr_len <= (others => '0');
+                                        else
+                                            i2c_wr_len <= unsigned(rx_byte);
+                                        end if;
+                                        param_cnt <= param_cnt + 1;
+                                        if cmd_byte = x"21" then
+                                            -- I2C Read - execute now (stub)
+                                            resp_len <= unsigned(rx_byte);
+                                            resp_idx <= (others => '0');
+                                            resp_buf <= (others => '0');  -- TODO: actual I2C read
+                                            state <= SEND_RESPONSE_BYTE;
+                                            cmd_byte <= x"00";
+                                        elsif cmd_byte = x"22" then
+                                            state <= IDLE;  -- Need rlen
+                                        elsif unsigned(rx_byte) = 0 then
+                                            -- No data to write
+                                            tx_byte <= x"00";
+                                            have_tx <= '1';
+                                            return_state <= IDLE;
+                                            cmd_byte <= x"00";
+                                            state <= IDLE;
+                                        else
+                                            param_need <= unsigned(rx_byte);
+                                            state <= IDLE;
+                                        end if;
+                                    elsif param_cnt = 2 and cmd_byte = x"22" then
+                                        i2c_rd_len <= unsigned(rx_byte);
+                                        param_cnt <= param_cnt + 1;
+                                        if i2c_wr_len = 0 then
+                                            -- No write data, just read
+                                            resp_len <= unsigned(rx_byte);
+                                            resp_idx <= (others => '0');
+                                            resp_buf <= (others => '0');
+                                            state <= SEND_RESPONSE_BYTE;
+                                            cmd_byte <= x"00";
+                                        else
+                                            param_need <= i2c_wr_len;
+                                            state <= IDLE;
+                                        end if;
+                                    else
+                                        -- Collecting write data
+                                        byte_idx := to_integer(param_cnt - 2);
+                                        if cmd_byte = x"22" then
+                                            byte_idx := to_integer(param_cnt - 3);
+                                        end if;
+                                        i2c_data_buf(byte_idx*8+7 downto byte_idx*8) <= rx_byte;
+                                        param_cnt <= param_cnt + 1;
+                                        
+                                        if param_cnt >= param_need + 1 then
+                                            -- TODO: Execute actual I2C operation
+                                            if cmd_byte = x"22" then
+                                                resp_len <= i2c_rd_len;
+                                            else
+                                                resp_len <= to_unsigned(1, 8);  -- Just ACK
+                                            end if;
+                                            resp_idx <= (others => '0');
+                                            resp_buf(7 downto 0) <= x"00";  -- ACK
+                                            state <= SEND_RESPONSE_BYTE;
+                                            cmd_byte <= x"00";
+                                        else
+                                            state <= IDLE;
+                                        end if;
+                                    end if;
+                                    
+                                when others =>
+                                    cmd_byte <= x"00";
+                                    state <= IDLE;
+                            end case;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG RESET (5x TMS=1)
+                    --------------------------------------------------------
+                    when JTAG_RESET_RUN =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                if jtag_cnt = 0 then
+                                    tms_reg <= '0';  -- Go to Run-Test/Idle
+                                    tx_byte <= x"00";
+                                    have_tx <= '1';
+                                    return_state <= IDLE;
+                                    state <= IDLE;
+                                else
+                                    jtag_cnt <= jtag_cnt - 1;
+                                end if;
+                            end if;
+                        end if;
+                        
+						
+						
+						----------------------------------------------------------------
+						when DEBUG_TCK_TOGGLE =>
+    if jtag_div = 0 then
+        tck_reg <= not tck_reg;
+        jtag_div <= JTAG_DIV_MAX;
+        if jtag_cnt = 0 then
+            tx_byte <= x"00";
+            have_tx <= '1';
+            return_state <= IDLE;
+            state <= IDLE;
+        else
+            jtag_cnt <= jtag_cnt - 1;
+        end if;
+    end if;
+	-------------------------------------------------------------------------------------
+						
+						
+						
+						
+						
+                    --------------------------------------------------------
+                    -- JTAG: Go to Shift-IR state
+                    --------------------------------------------------------
+                    when JTAG_GOTO_SHIFT_IR =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                case to_integer(jtag_cnt) is
+                                    when 0 => tms_reg <= '1'; jtag_cnt <= jtag_cnt + 1;  -- Select-DR
+                                    when 1 => tms_reg <= '1'; jtag_cnt <= jtag_cnt + 1;  -- Select-IR
+                                    when 2 => tms_reg <= '0'; jtag_cnt <= jtag_cnt + 1;  -- Capture-IR
+                                    when 3 => 
+                                        tms_reg <= '0';  -- Shift-IR
+                                        jtag_cnt <= (others => '0');
+                                        shift_cnt <= to_unsigned(IR_LENGTH, 16);
+                                        tdi_reg <= ir_value(0);
+                                        state <= JTAG_SHIFT_IR;
+                                    when others => null;
+                                end case;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG: Shift IR bits
+                    --------------------------------------------------------
+                    when JTAG_SHIFT_IR =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                shift_cnt <= shift_cnt - 1;
+                                if shift_cnt = 1 then
+                                    tms_reg <= '1';  -- Exit1-IR on last bit
+                                    state <= JTAG_EXIT_IR;
+                                else
+                                    tdi_reg <= ir_value(to_integer(to_unsigned(IR_LENGTH, 16) - shift_cnt + 1));
+                                end if;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG: Exit IR and go to Run-Test/Idle or Shift-DR
+                    --------------------------------------------------------
+                    when JTAG_EXIT_IR =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                case to_integer(jtag_cnt) is
+                                    when 0 => tms_reg <= '1'; jtag_cnt <= jtag_cnt + 1;  -- Update-IR
+                                    when 1 =>
+                                        jtag_cnt <= (others => '0');
+                                        state <= next_state;
+                                        if next_state = JTAG_GOTO_SHIFT_DR then
+                                            tms_reg <= '1';  -- Stay in select path
+                                        else
+                                            tms_reg <= '0';  -- Go to Run-Test/Idle
+                                        end if;
+                                    when others => null;
+                                end case;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG: Go to Shift-DR state
+                    --------------------------------------------------------
+                    when JTAG_GOTO_SHIFT_DR =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                case to_integer(jtag_cnt) is
+                                    when 0 => tms_reg <= '1'; jtag_cnt <= jtag_cnt + 1;  -- Select-DR
+                                    when 1 => tms_reg <= '0'; jtag_cnt <= jtag_cnt + 1;  -- Capture-DR
+                                    when 2 =>
+                                        tms_reg <= '0';  -- Shift-DR
+                                        jtag_cnt <= (others => '0');
+                                        shift_cnt <= dr_len;
+                                        tdi_reg <= shift_reg(to_integer(dr_len)-1);
+                                        state <= JTAG_SHIFT_DR;
+                                    when others => null;
+                                end case;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG: Shift DR bits
+                    --------------------------------------------------------
+                    when JTAG_SHIFT_DR =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '0' then
+                                -- Rising edge: sample TDO
+                                tdo_sample <= jtag_tdo;
+                            else
+                                -- Falling edge: shift and output next TDI
+                                shift_reg <= shift_reg(BSR_LENGTH-2 downto 0) & tdo_sample;
+                                shift_cnt <= shift_cnt - 1;
+                                if shift_cnt = 1 then
+                                    tms_reg <= '1';  -- Exit1-DR on last bit
+                                    state <= JTAG_EXIT_DR;
+                                else
+                                    tdi_reg <= shift_reg(to_integer(shift_cnt)-2);
+                                end if;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG: Exit DR and prepare response
+                    --------------------------------------------------------
+                    when JTAG_EXIT_DR =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                case to_integer(jtag_cnt) is
+                                    when 0 => tms_reg <= '1'; jtag_cnt <= jtag_cnt + 1;  -- Update-DR
+                                    when 1 =>
+                                        tms_reg <= '0';  -- Run-Test/Idle
+                                        jtag_cnt <= (others => '0');
+                                        -- Prepare response
+                                        resp_buf <= shift_reg;
+                                        resp_len <= resize((dr_len + 7) / 8, 8);
+                                        resp_idx <= (others => '0');
+                                        bsr_capture <= shift_reg;  -- Save captured data
+                                        
+                                        -- Special handling for read pin
+                                        if cmd_byte = x"17" then
+                                            if pin_num < BSR_LENGTH then
+                                                resp_buf(7 downto 0) <= "0000000" & shift_reg(to_integer(pin_num));
+                                            else
+                                                resp_buf(7 downto 0) <= x"00";
+                                            end if;
+                                            resp_len <= to_unsigned(1, 8);
+                                            cmd_byte <= x"00";
+                                        end if;
+                                        
+                                        state <= JTAG_GOTO_IDLE;
+                                    when others => null;
+                                end case;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- JTAG: Go to Run-Test/Idle then send response
+                    --------------------------------------------------------
+                    when JTAG_GOTO_IDLE =>
+                        if jtag_div = 0 then
+                            tck_reg <= not tck_reg;
+                            jtag_div <= JTAG_DIV_MAX;
+                            if tck_reg = '1' then
+                                tms_reg <= '0';
+                                state <= SEND_RESPONSE_BYTE;
+                            end if;
+                        end if;
+                        
+                    --------------------------------------------------------
+                    -- Send multi-byte response
+                    --------------------------------------------------------
+                    when SEND_RESPONSE_BYTE =>
+                        byte_idx := to_integer(resp_idx);
+                        tx_byte <= resp_buf(byte_idx*8+7 downto byte_idx*8);
+                        have_tx <= '1';
+                        resp_idx <= resp_idx + 1;
+                        if resp_idx + 1 >= resp_len then
+                            return_state <= IDLE;
+                            cmd_byte <= x"00";
+                        else
+                            return_state <= SEND_RESPONSE_BYTE;
+                        end if;
+                        state <= IDLE;
+                        
+                    when others =>
+                        state <= IDLE;
+                        
+                end case;
+            end if;
+        end if;
+    end process;
+
+end architecture;
+
+Here’s my reading of the design as it stands.
+
+What the code is trying to be
+
+This is a single top-level controller that combines four jobs:
+
+Host interface to an FT2232H-style FIFO bus (ft_data, ft_rxf_n, ft_txe_n, ft_rd_n, ft_wr_n)
+Command parser for a byte-oriented protocol coming from the PC
+JTAG engine that drives TCK/TMS/TDI and samples TDO
+Some early boundary-scan / I2C-over-boundary-scan application logic
+
+So conceptually it is:
+
+PC app -> FT FIFO byte stream -> command decoder -> JTAG sequence generator -> DUT JTAG pins
+
+with the extra intention that some higher-level commands represent:
+
+raw JTAG actions (reset, load IR, shift DR, read IDCODE)
+boundary-scan actions (sample BSR, load BSR, set pin, read pin)
+I2C actions implemented indirectly by manipulating DUT boundary-scan cells
+My understanding of the code flow
+1. Top level / ports / configuration
+
+The entity is called loopback_test, but it is no longer just a loopback test. It is really a JTAG boundary-scan controller with host command interface.
+
+The generics define:
+
+BSR_LENGTH: size of boundary scan register
+IR_LENGTH: JTAG instruction register length
+bit positions for I2C-related pins inside the BSR:
+SDA_OUT_BIT
+SDA_OE_BIT
+SDA_IN_BIT
+SCL_OUT_BIT
+SCL_OE_BIT
+
+That tells me the intended long-term direction is:
+
+load EXTEST
+write BSR bits to drive SCL/SDA
+sample BSR bits to read SDA
+thereby emulate I2C through JTAG boundary scan
+
+That is a valid architecture.
+
+2. Clock and reset
+
+It instantiates a Lattice OSCA oscillator and uses that as the internal clock.
+
+Then there is a simple power-up reset counter:
+
+rst_cnt counts to 255
+rst_done goes high
+rst_n is asserted after that
+
+It also:
+
+runs a heartbeat counter for LED blinking
+synchronizes ft_rxf_n and ft_txe_n through 3-stage shift registers
+
+So this part is mainly:
+
+internal clock generation
+startup reset delay
+synchronization of external async FIFO flags
+3. FT2232H FIFO interface
+
+The state machine starts with a set of FIFO-related states:
+
+IDLE
+READ_PULSE
+READ_CAPTURE
+READ_DONE
+WRITE_SETUP
+WRITE_PULSE
+WRITE_DONE
+
+This is doing a very basic byte-at-a-time interface:
+
+when RXF is active, read one byte from the FIFO
+when TXE allows transmit and have_tx = '1', write one byte back
+
+Important detail: the whole design is single-byte transactional at the host interface. It never streams a full command in one burst internally. Instead it:
+
+reads one byte
+goes to PROCESS_CMD
+decides whether that byte is a command or parameter
+maybe returns to IDLE to fetch more bytes
+
+So the command parser is incremental.
+
+4. Command parser / protocol state
+
+The parser revolves around:
+
+cmd_byte
+param_cnt
+param_need
+rx_byte
+Behavior
+
+If cmd_byte = x"00", the latest received byte is treated as a new command.
+
+If cmd_byte /= x"00", the design assumes it is in the middle of collecting parameters for that command.
+
+This is a common lightweight protocol style, but it means:
+
+one outstanding command at a time
+parser state is distributed across the main FSM
+command decoding and execution are tightly coupled
+Supported commands
+Utility
+0xFF: ping -> returns 0x55
+0x40: LED control
+Debug additions
+0x18: read raw TDO pin
+0x19: toggle TCK 10 times
+0x1A: force TMS high
+0x1B: force TMS low
+Raw JTAG
+0x10: JTAG reset
+0x11: read IDCODE
+0x12 <ir>: load IR
+0x13 <len_lo> <len_hi> <data...>: shift DR
+Boundary scan
+0x14: sample BSR
+0x15 <data...>: load full BSR with EXTEST
+0x16 <bit_lo> <bit_hi> <val>: set one BSR bit and apply EXTEST
+0x17 <bit_lo> <bit_hi>: sample BSR and return one bit
+I2C
+0x20, 0x21, 0x22, 0x23
+
+But the I2C portion is mostly a stub right now. It stores parameters and returns placeholder data rather than executing a real boundary-scan-driven I2C sequence.
+
+5. JTAG engine
+
+This is the most important part of the design.
+
+The code contains a low-level JTAG sequencer implemented directly in the main FSM through these states:
+
+JTAG_RESET_RUN
+JTAG_GOTO_SHIFT_IR
+JTAG_SHIFT_IR
+JTAG_EXIT_IR
+JTAG_GOTO_SHIFT_DR
+JTAG_SHIFT_DR
+JTAG_EXIT_DR
+JTAG_GOTO_IDLE
+What it does
+
+It manually drives the TAP controller by:
+
+toggling tck_reg
+setting tms_reg
+setting tdi_reg
+sampling jtag_tdo
+
+There is no explicit TAP-state variable like TEST_LOGIC_RESET, SHIFT_DR, etc.
+Instead, the TAP transitions are encoded procedurally by the FSM states and jtag_cnt.
+
+That works, but it is one reason the file is hard to manage: the design is mixing:
+
+TAP navigation
+shift timing
+command semantics
+host communications
+JTAG reset
+
+0x10 drives TMS=1 while toggling TCK enough times to force TAP reset, then returns to idle and sends 0x00.
+
+Shift IR
+
+JTAG_GOTO_SHIFT_IR walks the TAP path to Shift-IR.
+JTAG_SHIFT_IR clocks out ir_value.
+JTAG_EXIT_IR does Exit1-IR -> Update-IR, then either:
+
+continues to DR shifting, or
+returns toward idle
+Shift DR
+
+JTAG_GOTO_SHIFT_DR walks to Shift-DR.
+JTAG_SHIFT_DR shifts data through shift_reg, samples TDO, and stores captured bits back into the shift register.
+JTAG_EXIT_DR updates DR, packages the response, and later sends bytes back to the PC.
+
+Response handling
+
+After DR operations:
+
+resp_buf <= shift_reg
+resp_len <= ceil(dr_len/8)
+response bytes are transmitted from resp_buf
+
+So the DR shift serves both as:
+
+outgoing TDI source
+incoming TDO capture buffer
+6. Boundary-scan behavior
+
+The boundary-scan commands are built on top of the raw JTAG engine.
+
+0x14 Sample BSR
+load SAMPLE
+shift full BSR length in DR
+return captured bits
+0x15 Load BSR with EXTEST
+collect full BSR image into bsr_data
+load EXTEST
+shift the BSR image into DR
+0x16 Set single pin
+modify one bit of bsr_data
+load EXTEST
+shift full BSR back out
+
+This means bsr_data is intended to be the software-visible shadow copy of the boundary register contents.
+
+0x17 Read single pin
+load SAMPLE
+capture full BSR
+extract one bit from the captured shift register
+return it in one byte
+
+That all makes sense architecturally.
+
+7. I2C-over-JTAG intent
+
+There are many I2C-related signals:
+
+i2c_addr
+i2c_wr_len
+i2c_rd_len
+i2c_data_buf
+i2c_state, i2c_phase, i2c_timer
+i2c_sda_out, i2c_scl_out, i2c_sda_in
+scan support fields
+
+There are also I2C state constants:
+
+I2C_START
+I2C_SEND_ADDR
+I2C_GET_ACK
+I2C_WRITE_BYTE
+I2C_READ_BYTE
+I2C_STOP
+etc.
+
+But right now these are not actually connected into a working sequencer.
+
+So the code is really at this maturity level:
+
+raw JTAG: partially working
+boundary-scan primitives: mostly present
+I2C over boundary scan: planned, not implemented yet
+What I think is incomplete or risky in the current code
+
+A few things stand out immediately.
+
+1. IR constants vs IR length mismatch
+
+You set:
+
+IR_LENGTH : natural := 4
+
+But the instruction constants are declared as 8-bit values:
+
+x"00"
+x"05"
+x"02"
+x"0F"
+
+Only the lower IR_LENGTH bits are effectively relevant during shifting.
+
+That may be intentional, but it is conceptually muddy. If the target really has a 4-bit IR, these should probably be declared with IR-sized types or masked explicitly.
+
+2. Possible bit-order inconsistency in DR shifting
+
+In JTAG_GOTO_SHIFT_DR, first output bit is assigned as:
+
+tdi_reg <= shift_reg(to_integer(dr_len)-1);
+
+But later, in JTAG_SHIFT_DR, the next bits come from:
+
+tdi_reg <= shift_reg(to_integer(shift_cnt)-2);
+
+At the same time, captured TDO is shifted into:
+
+shift_reg <= shift_reg(BSR_LENGTH-2 downto 0) & tdo_sample;
+
+This suggests the code is treating one end of the vector as the “current outgoing MSB,” but for JTAG/BSR work, bit ordering matters a lot. I would want to verify very carefully whether:
+
+bit 0 in host byte stream
+bit index in bsr_data
+first bit shifted on TDI
+returned bit position in resp_buf
+
+all line up with the BSDL-defined scan order.
+
+This is one of the first things I’d isolate and clean up.
+
+3. 0x15 and 0x16 may shift stale bsr_data
+
+In these areas you do assignments like:
+
+modify bsr_data(...) <= ...
+then shift_reg <= bsr_data
+
+Because these are signal assignments inside a clocked process, shift_reg <= bsr_data will usually see the old bsr_data value in that same cycle, not the just-updated bit. That means a just-written pin/byte may not actually be present in the shift operation you launch immediately afterward.
+
+That is a real structural issue.
+
+A cleaner approach is:
+
+use a variable or temporary next-image
+then assign the completed image to bsr_data and shift_reg
+or
+separate “update shadow BSR” from “start JTAG transaction” across states
+4. The main FSM is doing too much
+
+Right now one state machine handles:
+
+FT FIFO timing
+protocol parsing
+JTAG TAP stepping
+shift register management
+response transmission
+debug operations
+boundary scan shadow state
+early I2C state
+
+That is the biggest maintainability problem.
+
+5. I2C state machinery exists but is not integrated
+
+The I2C state constants and signals suggest you were heading toward a second engine, but at the moment the command parser just returns zero-filled dummy responses. So these signals currently add cognitive load without functional payoff.
+
+6. Naming no longer matches purpose
+
+The entity name loopback_test is misleading now. This file is functioning as a controller, not a loopback demo.
+
+Suggested modular breakdown
+
+I would split this into layers rather than by command number.
+
+Recommended file structure
+1. jtag_types_pkg.vhd
+
+Put all shared constants/types here.
+
+Contents:
+
+command opcodes
+JTAG instruction constants
+utility functions like ceil-bytes
+record/type definitions for requests and responses
+TAP state enum if you introduce one
+
+Example contents:
+
+type main_cmd_t
+type jtag_op_t
+function bytes_for_bits(n : natural) return natural
+constant CMD_PING : std_logic_vector(7 downto 0) := x"FF"
+
+This keeps magic numbers out of the logic files.
+
+2. ft_fifo_if.vhd
+
+Dedicated FT2232H FIFO byte interface.
+
+Responsibility:
+
+synchronize RXF#, TXE#
+perform read/write pulse timing
+expose a simple internal interface like:
+
+Inputs:
+
+tx_valid, tx_data
+
+Outputs:
+
+tx_ready
+rx_valid, rx_data
+
+This module should not know anything about JTAG or I2C.
+
+Think of it as a byte stream adapter.
+
+3. cmd_parser.vhd
+
+Consumes received bytes and produces decoded command requests.
+
+Responsibility:
+
+maintain cmd_byte, param_cnt, param_need
+collect length fields and payload bytes
+produce normalized command records such as:
+jtag_reset_req
+load_ir_req
+shift_dr_req
+sample_bsr_req
+set_pin_req
+i2c_write_req
+
+This is where the command protocol belongs.
+
+The big benefit is that your transport/protocol parsing becomes separate from execution.
+
+4. jtag_tap_fsm.vhd
+
+Pure TAP navigation and shift engine.
+
+Responsibility:
+
+drive TCK/TMS/TDI
+sample TDO
+execute abstract operations like:
+reset TAP
+shift IR of length N
+shift DR of length N
+report completion and captured shift data
+
+Internal API idea:
+
+input: start, op, bit_len, tx_bits
+output: busy, done, rx_bits
+
+This module should not know what EXTEST means functionally, nor what an LED command is.
+
+5. boundary_scan_ctrl.vhd
+
+Higher-level boundary-scan functions built on top of the JTAG engine.
+
+Responsibility:
+
+maintain bsr_shadow
+implement:
+sample full BSR
+write full BSR with EXTEST
+set single bit
+read single bit
+translate those into sequences for jtag_tap_fsm
+
+This is where BSR indexing and scan-order conventions should live.
+
+6. i2c_over_bscan.vhd
+
+A dedicated sequencer for I2C using boundary scan.
+
+Responsibility:
+
+implement START/STOP/ACK/read/write semantics
+use boundary_scan_ctrl primitives to:
+drive SDA/SCL
+switch SDA output enable
+sample SDA
+return status/data/ack errors
+
+This module should know:
+
+which BSR bits map to SDA/SCL/OE
+how to perform open-drain behavior correctly
+
+This is a much better home for the I2C state constants you already created.
+
+7. response_mux.vhd or merge into command executor
+
+Takes results from raw JTAG / boundary scan / I2C engines and formats byte responses for the PC.
+
+In a smaller design this can stay in the main controller, but it should still be logically separate from the byte parser and TAP sequencer.
+
+8. jtag_boundary_scan_top.vhd
+
+Top-level integration module.
+
+Responsibility:
+
+instantiate oscillator/reset
+instantiate ft_fifo_if
+instantiate cmd_parser
+instantiate command executor / dispatch
+instantiate jtag_tap_fsm
+instantiate boundary_scan_ctrl
+instantiate i2c_over_bscan
+drive LEDs and external pins
+
+This becomes the only file that sees the whole system.
+
+Practical split for your exact code
+
+If you want the least disruptive first refactor, I would do it in three steps.
+
+Step 1: extract package + low-level FT interface
+
+Create:
+
+jtag_pkg.vhd
+ft_fifo_if.vhd
+
+Move:
+
+opcodes
+instruction constants
+helper constants/functions
+FT read/write timing logic and synchronizers
+
+This alone will make the top file much easier to read.
+
+Step 2: extract JTAG engine
+
+Create:
+
+jtag_master.vhd
+
+Move:
+
+JTAG_RESET_RUN
+JTAG_GOTO_SHIFT_IR
+JTAG_SHIFT_IR
+JTAG_EXIT_IR
+JTAG_GOTO_SHIFT_DR
+JTAG_SHIFT_DR
+JTAG_EXIT_DR
+JTAG_GOTO_IDLE
+debug TCK toggle if you still want it
+
+Expose a clean command interface like:
+
+req_valid
+req_kind = reset / shift_ir / shift_dr / shift_ir_then_dr
+req_ir
+req_dr_len
+req_dr_data
+rsp_valid
+rsp_dr_data
+
+This is the single biggest cleanup win.
+
+Step 3: separate protocol/application layer
+
+Create:
+
+host_cmd_ctrl.vhd
+boundary_scan_ctrl.vhd
+later i2c_over_bscan.vhd
+
+Move:
+
+bytewise command decode into host_cmd_ctrl
+BSR shadow handling into boundary_scan_ctrl
+keep I2C stub out until boundary-scan primitives are solid
+Proposed final hierarchy
+
+Something like this:
+
+jtag_boundary_scan_top
+├── clock_reset
+├── ft_fifo_if
+├── host_cmd_ctrl
+├── jtag_master
+├── boundary_scan_ctrl
+└── i2c_over_bscan
+
+And shared definitions in:
+
+jtag_pkg
+bscan_pkg
+How I would divide responsibilities
+host_cmd_ctrl
+
+Knows about:
+
+byte protocol from PC
+command framing
+response framing
+
+Does not know:
+
+exact TCK pulse sequencing
+jtag_master
+
+Knows about:
+
+TAP motion
+bit shifting
+TDO capture timing
+
+Does not know:
+
+boundary-scan pin numbers
+I2C protocol
+FT2232 details
+boundary_scan_ctrl
+
+Knows about:
+
+EXTEST / SAMPLE
+BSR image maintenance
+single-bit read/write helpers
+
+Does not know:
+
+FT2232 timing
+raw host parser details
+i2c_over_bscan
+
+Knows about:
+
+START, STOP, ACK, address/data bytes
+open-drain emulation using BSR cells
+
+Does not know:
+
+how the command arrived from USB
+exact JTAG TAP state timing
+My recommendation for what to do first
+
+Before implementing more I2C, I would first stabilize the core JTAG/boundary-scan layer.
+
+Specifically:
+
+extract the JTAG engine into its own module
+define and verify the exact bit ordering for DR/BSR shifts
+fix the bsr_data shadow update issue
+rename the top-level entity to something closer to its real role
+only then build the I2C-over-boundary-scan sequencer on top
+
+That order matters because if scan bit ordering is even slightly wrong, the I2C layer will be very hard to debug.
+
+Concise summary of my understanding
+
+This code is a monolithic prototype of a USB-to-JTAG boundary-scan controller.
+It already contains:
+
+a working-ish host byte interface
+command parsing
+low-level JTAG reset / IR / DR shifting
+boundary-scan sample and write primitives
+
+It does not yet contain a real I2C engine, although the scaffolding for one is present.
+
+Its main problem is not the overall idea. The idea is sound.
+The problem is that all abstraction levels are mixed into one FSM, which makes the design hard to reason about, test, and extend.
+
+If you want, next I can turn this into a concrete refactor plan with proposed entity interfaces for each new VHDL file.
+
+Yes please do
+
+Here’s a concrete refactor plan with a proposed file set and entity interfaces.
+
+I’ll keep it practical and close to your current code so it feels like an incremental cleanup rather than a total rewrite.
+
+Refactor goal
+
+Turn the current one-file design into a small stack of modules:
+
+one module for the FT FIFO byte interface
+one module for command parsing
+one module for the low-level JTAG engine
+one module for boundary-scan operations
+one top-level file that wires them together
+later, one module for I2C over boundary scan
+
+That gives you a clean separation between:
+
+transport
+command protocol
+JTAG bit-level execution
+boundary-scan application logic
+Suggested file list
+First-pass split
+jtag_pkg.vhd
+
+Shared constants, types, helper functions.
+
+ft245_sync_if.vhd
+
+FT2232H synchronous FIFO interface, one byte at a time.
+
+host_cmd_parser.vhd
+
+Collects bytes from the PC and emits decoded requests.
+
+jtag_master.vhd
+
+Drives TCK/TMS/TDI, samples TDO, executes reset / IR / DR operations.
+
+bscan_controller.vhd
+
+Maintains BSR shadow image and implements sample/write/set-pin/read-pin operations.
+
+jtag_boundary_scan_top.vhd
+
+Top-level integration.
+
+Later
+i2c_bscan_master.vhd
+
+Implements I2C transactions on top of bscan_controller.
+
+1) jtag_pkg.vhd
+
+This should be the first file you create.
+
+It removes magic numbers and shared definitions from all other files.
+
+What goes in it
+command opcodes
+JTAG instruction constants
+type definitions
+helper functions
+common subtypes
+Example structure
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+package jtag_pkg is
+
+    constant MAX_BSR_LENGTH : natural := 1024;
+    constant MAX_BSR_BYTES  : natural := (MAX_BSR_LENGTH + 7) / 8;
+
+    -- Host commands
+    constant CMD_JTAG_RESET   : std_logic_vector(7 downto 0) := x"10";
+    constant CMD_READ_IDCODE  : std_logic_vector(7 downto 0) := x"11";
+    constant CMD_LOAD_IR      : std_logic_vector(7 downto 0) := x"12";
+    constant CMD_SHIFT_DR     : std_logic_vector(7 downto 0) := x"13";
+    constant CMD_SAMPLE_BSR   : std_logic_vector(7 downto 0) := x"14";
+    constant CMD_LOAD_BSR     : std_logic_vector(7 downto 0) := x"15";
+    constant CMD_SET_PIN      : std_logic_vector(7 downto 0) := x"16";
+    constant CMD_READ_PIN     : std_logic_vector(7 downto 0) := x"17";
+    constant CMD_READ_TDO     : std_logic_vector(7 downto 0) := x"18";
+    constant CMD_TOGGLE_TCK   : std_logic_vector(7 downto 0) := x"19";
+    constant CMD_SET_TMS_HI   : std_logic_vector(7 downto 0) := x"1A";
+    constant CMD_SET_TMS_LO   : std_logic_vector(7 downto 0) := x"1B";
+    constant CMD_I2C_WRITE    : std_logic_vector(7 downto 0) := x"20";
+    constant CMD_I2C_READ     : std_logic_vector(7 downto 0) := x"21";
+    constant CMD_I2C_WR_RD    : std_logic_vector(7 downto 0) := x"22";
+    constant CMD_I2C_SCAN     : std_logic_vector(7 downto 0) := x"23";
+    constant CMD_LED          : std_logic_vector(7 downto 0) := x"40";
+    constant CMD_PING         : std_logic_vector(7 downto 0) := x"FF";
+
+    type jtag_req_kind_t is (
+        JTAG_REQ_NONE,
+        JTAG_REQ_RESET,
+        JTAG_REQ_SHIFT_IR,
+        JTAG_REQ_SHIFT_DR,
+        JTAG_REQ_SHIFT_IR_DR,
+        JTAG_REQ_TOGGLE_TCK,
+        JTAG_REQ_SET_TMS
+    );
+
+    type host_req_kind_t is (
+        HOST_REQ_NONE,
+        HOST_REQ_PING,
+        HOST_REQ_LED,
+        HOST_REQ_RAW_JTAG_RESET,
+        HOST_REQ_RAW_JTAG_LOAD_IR,
+        HOST_REQ_RAW_JTAG_SHIFT_DR,
+        HOST_REQ_RAW_IDCODE,
+        HOST_REQ_BSCAN_SAMPLE,
+        HOST_REQ_BSCAN_LOAD,
+        HOST_REQ_BSCAN_SET_PIN,
+        HOST_REQ_BSCAN_READ_PIN,
+        HOST_REQ_DEBUG_READ_TDO,
+        HOST_REQ_DEBUG_TOGGLE_TCK,
+        HOST_REQ_DEBUG_SET_TMS,
+        HOST_REQ_I2C_WRITE,
+        HOST_REQ_I2C_READ,
+        HOST_REQ_I2C_WR_RD,
+        HOST_REQ_I2C_SCAN
+    );
+
+    function bytes_for_bits(nbits : natural) return natural;
+
+end package;
+
+package body jtag_pkg is
+
+    function bytes_for_bits(nbits : natural) return natural is
+    begin
+        return (nbits + 7) / 8;
+    end function;
+
+end package body;
+Why this helps
+
+Once this exists, every other file gets shorter and more readable.
+
+2) ft245_sync_if.vhd
+
+This module should own all FT FIFO timing and synchronizer logic.
+
+Your current main FSM spends too much effort on READ_PULSE, WRITE_SETUP, and friends.
+
+Responsibility
+
+Translate FT signals into a simple byte-stream style interface:
+
+RX side
+rx_valid
+rx_data
+optional rx_ready
+TX side
+tx_valid
+tx_data
+tx_ready
+Proposed entity
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity ft245_sync_if is
+    port (
+        clk         : in    std_logic;
+        rst_n       : in    std_logic;
+
+        ft_data     : inout std_logic_vector(7 downto 0);
+        ft_rxf_n    : in    std_logic;
+        ft_txe_n    : in    std_logic;
+        ft_rd_n     : out   std_logic;
+        ft_wr_n     : out   std_logic;
+        ft_siwu_n   : out   std_logic;
+
+        rx_valid    : out   std_logic;
+        rx_data     : out   std_logic_vector(7 downto 0);
+
+        tx_valid    : in    std_logic;
+        tx_data     : in    std_logic_vector(7 downto 0);
+        tx_ready    : out   std_logic
+    );
+end entity;
+Internal behavior
+
+This module should:
+
+synchronize ft_rxf_n and ft_txe_n
+generate safe read/write pulses
+present a byte once on rx_valid
+accept a transmit byte when tx_valid='1' and it can write
+Simplification
+
+At first, keep it single-byte / non-streaming, just like your current design.
+No need to add FIFOs internally yet.
+
+3) host_cmd_parser.vhd
+
+This module should consume incoming bytes and emit complete decoded requests.
+
+Right now the parser logic is mixed with execution logic. Split those apart.
+
+Responsibility
+remember current opcode
+count parameters
+assemble payload bytes
+emit one normalized request when command is complete
+
+It should not execute JTAG directly.
+
+Proposed entity
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.jtag_pkg.all;
+
+entity host_cmd_parser is
+    generic (
+        BSR_LENGTH : natural := 362
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+
+        rx_valid        : in  std_logic;
+        rx_data         : in  std_logic_vector(7 downto 0);
+
+        req_valid       : out std_logic;
+        req_kind        : out host_req_kind_t;
+
+        req_byte        : out std_logic_vector(7 downto 0);
+        req_word        : out unsigned(15 downto 0);
+        req_data        : out std_logic_vector(BSR_LENGTH-1 downto 0);
+        req_data_len    : out unsigned(15 downto 0);
+
+        busy            : in  std_logic
+    );
+end entity;
+Meaning of the fields
+req_kind: decoded operation
+req_byte: small single-byte payload, like LED value or IR value
+req_word: pin number or general 16-bit numeric parameter
+req_data: DR or BSR payload
+req_data_len: bit length of req_data
+
+busy lets the parser hold off issuing a new request while the executor is still processing the last one.
+
+Alternative
+
+If you want to be cleaner, define a VHDL record type for requests in the package.
+That’s nicer architecturally, but not essential for first refactor.
+
+4) jtag_master.vhd
+
+This is the most important extraction.
+
+It should become the only place that knows how to:
+
+navigate TAP states
+toggle TCK
+drive TMS/TDI
+sample TDO
+Responsibility
+
+Accept an abstract JTAG request and perform it.
+
+Proposed entity
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.jtag_pkg.all;
+
+entity jtag_master is
+    generic (
+        MAX_SHIFT_BITS   : natural := 1024;
+        IR_LENGTH        : natural := 4;
+        JTAG_DIV_WIDTH   : natural := 8;
+        JTAG_DIV_VALUE   : natural := 255
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+
+        req_valid       : in  std_logic;
+        req_kind        : in  jtag_req_kind_t;
+        req_ir          : in  std_logic_vector(7 downto 0);
+        req_dr_len      : in  unsigned(15 downto 0);
+        req_dr_data     : in  std_logic_vector(MAX_SHIFT_BITS-1 downto 0);
+        req_tms_value   : in  std_logic;
+        req_tck_edges   : in  unsigned(15 downto 0);
+
+        busy            : out std_logic;
+        done            : out std_logic;
+        rsp_dr_data     : out std_logic_vector(MAX_SHIFT_BITS-1 downto 0);
+        rsp_dr_len      : out unsigned(15 downto 0);
+
+        jtag_tck        : out std_logic;
+        jtag_tms        : out std_logic;
+        jtag_tdi        : out std_logic;
+        jtag_tdo        : in  std_logic
+    );
+end entity;
+Supported request types
+JTAG_REQ_RESET
+JTAG_REQ_SHIFT_IR
+JTAG_REQ_SHIFT_DR
+JTAG_REQ_SHIFT_IR_DR
+JTAG_REQ_TOGGLE_TCK
+JTAG_REQ_SET_TMS
+Notes
+
+This module should not know:
+
+what command byte came from PC
+what EXTEST or SAMPLE mean at the application level
+what a pin number is
+
+It just executes low-level JTAG requests.
+
+Internal improvement I strongly recommend
+
+Introduce an actual TAP-state enum internally, even if only for readability.
+
+Something like:
+
+type tap_nav_state_t is (
+    TAP_IDLE,
+    TAP_RESET,
+    TAP_GOTO_SHIFT_IR,
+    TAP_SHIFT_IR,
+    TAP_EXIT_IR,
+    TAP_GOTO_SHIFT_DR,
+    TAP_SHIFT_DR,
+    TAP_EXIT_DR,
+    TAP_RETURN_IDLE
+);
+
+That is much easier to reason about than mixing transport and protocol states.
+
+5) bscan_controller.vhd
+
+This should sit on top of jtag_master.
+
+Responsibility
+
+Implement boundary-scan oriented operations:
+
+sample full BSR
+apply full BSR with EXTEST
+set one bit in shadow BSR then apply
+sample BSR then return one bit
+later expose helpers for I2C pin manipulation
+Proposed entity
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity bscan_controller is
+    generic (
+        BSR_LENGTH  : natural := 362;
+        IR_LENGTH   : natural := 4
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+
+        req_valid       : in  std_logic;
+        req_op          : in  std_logic_vector(2 downto 0);
+        req_pin_num     : in  unsigned(15 downto 0);
+        req_pin_val     : in  std_logic;
+        req_bsr_data    : in  std_logic_vector(BSR_LENGTH-1 downto 0);
+
+        busy            : out std_logic;
+        done            : out std_logic;
+        rsp_bsr_data    : out std_logic_vector(BSR_LENGTH-1 downto 0);
+        rsp_pin_val     : out std_logic;
+
+        jtag_req_valid  : out std_logic;
+        jtag_req_kind   : out jtag_req_kind_t;
+        jtag_req_ir     : out std_logic_vector(7 downto 0);
+        jtag_req_dr_len : out unsigned(15 downto 0);
+        jtag_req_dr_data: out std_logic_vector(BSR_LENGTH-1 downto 0);
+
+        jtag_busy       : in  std_logic;
+        jtag_done       : in  std_logic;
+        jtag_rsp_data   : in  std_logic_vector(BSR_LENGTH-1 downto 0)
+    );
+end entity;
+Operations
+
+Use simple encoded ops like:
+
+000 = sample_bsr
+001 = load_bsr_extest
+010 = set_pin
+011 = read_pin
+
+Or use a proper enum in the package.
+
+Important design choice
+
+This module should own:
+
+bsr_shadow
+bsr_last_capture
+
+That keeps all BSR-related state in one place.
+
+Fixing your current stale-shadow problem
+
+Inside this module, for set_pin, do something like:
+
+variable next_bsr : std_logic_vector(BSR_LENGTH-1 downto 0);
+
+then:
+
+copy current shadow to next_bsr
+modify the pin bit in next_bsr
+launch JTAG shift with next_bsr
+update shadow from next_bsr
+
+That avoids the signal-assignment race you currently have.
+
+6) jtag_boundary_scan_top.vhd
+
+This becomes the clean integration point.
+
+Proposed entity
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity jtag_boundary_scan_top is
+    generic (
+        BSR_LENGTH      : natural := 362;
+        IR_LENGTH       : natural := 4;
+        SDA_OUT_BIT     : natural := 10;
+        SDA_OE_BIT      : natural := 11;
+        SDA_IN_BIT      : natural := 9;
+        SCL_OUT_BIT     : natural := 14;
+        SCL_OE_BIT      : natural := 15
+    );
+    port (
+        ft_data         : inout std_logic_vector(7 downto 0);
+        ft_rxf_n        : in    std_logic;
+        ft_txe_n        : in    std_logic;
+        ft_rd_n         : out   std_logic;
+        ft_wr_n         : out   std_logic;
+        ft_siwu_n       : out   std_logic;
+
+        jtag_tck        : out   std_logic;
+        jtag_tms        : out   std_logic;
+        jtag_tdi        : out   std_logic;
+        jtag_tdo        : in    std_logic;
+
+        led             : out   std_logic_vector(1 downto 0)
+    );
+end entity;
+What stays in top
+
+Only integration concerns:
+
+oscillator
+reset generation
+LED heartbeat
+module instances
+command routing
+response muxing
+
+The top-level file should not contain a giant behavioral FSM anymore.
+
+7) Suggested command execution split in top
+
+The top-level can contain a much smaller control FSM that only does dispatch.
+
+Example states
+type exec_state_t is (
+    EXEC_IDLE,
+    EXEC_HANDLE_LOCAL,
+    EXEC_START_JTAG,
+    EXEC_WAIT_JTAG,
+    EXEC_START_BSCAN,
+    EXEC_WAIT_BSCAN,
+    EXEC_SEND_RESPONSE
+);
+
+This is very different from your current FSM.
+
+It does not toggle TCK or pulse FT control signals itself.
+
+It just:
+
+waits for a parsed command
+decides whether it is local, JTAG, or boundary-scan
+waits for the selected backend
+streams response bytes back through ft245_sync_if
+Concrete ownership of your current signals
+
+Here’s where I would move the existing signals.
+
+Keep in top
+clk
+rst_cnt, rst_done, rst_n
+hb_cnt
+led_reg
+simple response mux state
+Move to ft245_sync_if
+ft_data_out
+ft_data_oe
+rxf_sync
+txe_sync
+rxf_n
+txe_n
+ft_rd_n, ft_wr_n
+FIFO timing states
+wait_cnt related to FT timing
+Move to host_cmd_parser
+cmd_byte
+rx_byte
+param_cnt
+param_need
+all byte collection for opcodes and parameters
+Move to jtag_master
+tck_reg
+tms_reg
+tdi_reg
+tdo_sample
+jtag_cnt
+jtag_div
+shift_reg
+shift_len
+shift_cnt
+ir_value
+all JTAG_* states
+DEBUG_TCK_TOGGLE
+Move to bscan_controller
+bsr_data
+bsr_capture
+pin_num
+pin_val
+EXTEST/SAMPLE sequencing logic
+read-pin / set-pin behavior
+Later move to i2c_bscan_master
+i2c_* signals
+all I2C state constants
+Recommended implementation order
+Phase 1: package + rename top
+
+Create:
+
+jtag_pkg.vhd
+rename entity loopback_test -> jtag_boundary_scan_top
+
+Do not change behavior yet.
+
+Phase 2: extract FT interface
+
+Move the FT read/write states into ft245_sync_if.vhd.
+
+Top now gets:
+
+rx_valid, rx_data
+tx_valid, tx_data, tx_ready
+Phase 3: extract JTAG engine
+
+Move the JTAG states into jtag_master.vhd.
+
+Top should now be able to ask:
+
+reset JTAG
+load IR
+shift DR
+get DR result
+
+At this phase you already get a huge readability improvement.
+
+Phase 4: extract boundary-scan controller
+
+Move:
+
+0x14, 0x15, 0x16, 0x17 behavior
+bsr_shadow
+
+At this stage your design becomes structurally solid.
+
+Phase 5: implement I2C cleanly
+
+Only after the above is stable:
+
+write i2c_bscan_master.vhd
+use boundary-scan primitive ops, not direct top-level hacks
+Strong recommendation on interfaces
+
+Try to make module interfaces use start/busy/done handshakes.
+
+For example:
+
+input req_valid
+output busy
+output done
+
+That style fits your current architecture well and is easy to debug in simulation.
+
+For payload transfers:
+
+present request fields together with req_valid
+latch them internally on acceptance
+assert done for one cycle when the operation finishes
+
+This is much easier than making everything fully streaming right away.
+
+Response handling suggestion
+
+Instead of keeping resp_buf, resp_len, and resp_idx scattered across the design, centralize them in the top-level response sender.
+
+Small response sender block
+
+Top-level owns:
+
+resp_buf
+resp_len
+resp_idx
+resp_active
+
+When any backend finishes:
+
+top loads resp_buf
+sets resp_len
+streams bytes out through ft245_sync_if
+
+That way:
+
+backends generate results
+top decides how to serialize them to USB
+
+That’s cleaner.
+
+One concrete structure for top-level dispatch
+
+A practical dispatch rule set could be:
+
+PING, LED, READ_TDO, SET_TMS, TOGGLE_TCK
+handled directly in top or via jtag_master
+LOAD_IR, SHIFT_DR, RESET, READ_IDCODE
+handled via jtag_master
+SAMPLE_BSR, LOAD_BSR, SET_PIN, READ_PIN
+handled via bscan_controller
+I2C_*
+later handled via i2c_bscan_master
+Naming cleanup I recommend
+
+Your current names are prototype-ish. I would rename some of them.
+
+loopback_test -> jtag_boundary_scan_top
+shift_reg -> jtag_shift_buf
+resp_buf -> tx_resp_buf
+cmd_byte -> active_cmd
+have_tx -> tx_pending
+dr_len -> dr_bit_count
+bsr_data -> bsr_shadow
+bsr_capture -> bsr_sampled
+
+Small naming improvements make a big difference once split across files.
+
+One possible directory layout
+rtl/
+  jtag_pkg.vhd
+  ft245_sync_if.vhd
+  host_cmd_parser.vhd
+  jtag_master.vhd
+  bscan_controller.vhd
+  jtag_boundary_scan_top.vhd
+
+rtl/i2c/
+  i2c_bscan_master.vhd
+
+If you later add simulation:
+
+tb/
+  tb_jtag_master.vhd
+  tb_bscan_controller.vhd
+  tb_host_cmd_parser.vhd
+What I would do immediately, in code terms
+
+If we were starting the refactor now, I would first create these three files:
+
+jtag_pkg.vhd
+ft245_sync_if.vhd
+jtag_master.vhd
+
+Then I would keep a temporary top-level that still does:
+
+command parsing
+boundary-scan logic
+
+That gives you the biggest reduction in complexity fastest.
+
+After that, extract:
+
+host_cmd_parser.vhd
+bscan_controller.vhd
+
+That sequence minimizes breakage.
+
+Minimal first milestone
+
+A very good first milestone is this:
+
+Top-level supports only:
+
+0xFF ping
+0x10 reset
+0x12 load IR
+0x13 shift DR
+0x18 read TDO
+0x19 toggle TCK
+0x1A, 0x1B set TMS
+
+All via:
+
+ft245_sync_if
+jtag_master
+
+Once that works, add boundary-scan commands on top.
+
+That gives you a tested raw JTAG layer before layering more semantics onto it.
+
+My recommendation in one sentence
+
+Refactor first into:
+transport -> parser -> JTAG engine -> boundary-scan layer -> I2C layer,
+with the top-level doing only wiring and response dispatch.
+
+If you want, next I can draft the actual contents of jtag_pkg.vhd and jtag_master.vhd in VHDL so you have a concrete starting point.
+
+Lets take this in steps. I have now created all the files you suggested and pasted the entities in each. Which file do we start with? Connecting everything up in the top entity or focusing on one part at a time and develop that fully?
+
+Start with one part at a time, not the top-level wiring.
+
+The best order is:
+
+jtag_pkg.vhd
+jtag_master.vhd
+ft245_sync_if.vhd
+host_cmd_parser.vhd
+bscan_controller.vhd
+jtag_boundary_scan_top.vhd
+i2c_bscan_master.vhd later
+Why this order
+
+The top entity should be the last place you do real work in, not the first.
+If you wire everything up before the core blocks are stable, you end up debugging:
+
+module bugs
+interface bugs
+integration bugs
+
+all at once.
+
+That gets messy fast.
+
+The lowest-risk approach is:
+
+make each block compile cleanly
+define its handshake clearly
+get its behavior sane in isolation
+then integrate
+Where to start first
+
+Start with jtag_pkg.vhd.
+
+It is the foundation for the others because it defines:
+
+shared constants
+enums/types
+helper functions
+command opcodes
+
+You want those fixed before the modules start depending on them.
+
+After that, go straight to jtag_master.vhd.
+
+That is the technical core of the whole project. If the JTAG engine is not solid, everything above it becomes hard to trust:
+
+boundary scan
+pin access
+I2C-over-boundary-scan
+
+all depend on it.
+
+So the real first development target is:
+
+get jtag_master working as a standalone engine
+
+with support for:
+
+reset
+shift IR
+shift DR
+optional shift IR then DR
+debug toggle TCK
+set TMS
+What not to do yet
+
+Do not start by fully wiring jtag_boundary_scan_top.vhd.
+
+At most, make a tiny temporary harness later that instantiates just:
+
+oscillator/reset
+jtag_master
+
+and drives a fixed test sequence.
+
+But don’t try to integrate:
+
+FIFO interface
+parser
+boundary scan controller
+response mux
+
+until the core engine is behaving.
+
+Practical step-by-step plan
+Step 1: finish jtag_pkg.vhd
+
+Make sure it compiles and contains:
+
+command constants
+jtag_req_kind_t
+maybe a bscan_req_kind_t
+helper bytes_for_bits
+
+Keep it simple.
+
+Step 2: develop jtag_master.vhd
+
+This is the first real module to complete.
+
+Focus only on its contract:
+
+Inputs:
+
+request kind
+IR value
+DR bit length
+DR payload
+TMS value
+TCK edge count
+
+Outputs:
+
+busy
+done
+captured DR data
+JTAG pins
+
+Ignore FT, command bytes, LEDs, and I2C for now.
+
+First milestone inside jtag_master
+
+Get these operations working in order:
+
+JTAG_REQ_SET_TMS
+JTAG_REQ_TOGGLE_TCK
+JTAG_REQ_RESET
+JTAG_REQ_SHIFT_IR
+JTAG_REQ_SHIFT_DR
+JTAG_REQ_SHIFT_IR_DR
+
+That sequence gives you progressively more confidence.
+
+Step 3: only then do ft245_sync_if.vhd
+
+This is independent enough to build separately.
+
+Once jtag_master is reasonable, the next easiest block is the FT interface.
+
+Why before parser?
+Because the parser depends on receiving bytes cleanly.
+The FT interface is just transport.
+
+Step 4: then host_cmd_parser.vhd
+
+Once byte RX/TX is defined, build the parser.
+
+At this stage you can already support:
+
+ping
+LED
+raw JTAG commands
+
+without touching boundary scan yet.
+
+Step 5: then bscan_controller.vhd
+
+Once jtag_master is stable, boundary scan becomes much easier.
+
+This module should be built on a trusted JTAG backend.
+
+Step 6: then top-level integration
+
+Now wire together:
+
+clock/reset
+FT interface
+parser
+JTAG master
+boundary scan controller
+response sender
+
+At this point the top file becomes straightforward.
+
+Recommended mindset
+
+Treat the top-level as plumbing, not as the place where behavior is invented.
+
+Each submodule should answer:
+
+what request do I accept?
+when am I busy?
+when am I done?
+what result do I return?
+
+If that is clear, top-level integration becomes mostly routing.
+
+Very concrete recommendation for right now
+
+Open jtag_pkg.vhd and jtag_master.vhd, and work on those first.
+
+If you want the most productive next step, do this exact sequence:
+
+finalize the package types/constants
+implement jtag_master with only reset + TCK toggle + set TMS first
+then add IR shift
+then add DR shift
+then verify done/busy behavior is clean
+only after that move upward
+
+That gives you a firm base.
+
+Next, paste your current jtag_pkg.vhd and jtag_master.vhd, and I’ll help you shape those first.

@@ -10,6 +10,7 @@ architecture sim of tb_jtag_master is
 
     constant CLK_PERIOD     : time := 10 ns;
     constant MAX_SHIFT_BITS : natural := 32;
+    constant MAX_IR_BITS    : natural := 24;
     constant IR_LENGTH      : natural := 4;
 
     signal clk             : std_logic := '0';
@@ -17,7 +18,8 @@ architecture sim of tb_jtag_master is
 
     signal req_valid       : std_logic := '0';
     signal req_kind        : jtag_req_kind_t := JTAG_REQ_NONE;
-    signal req_ir          : std_logic_vector(7 downto 0) := (others => '0');
+    signal req_ir_len      : unsigned(15 downto 0) := (others => '0');
+    signal req_ir_data     : std_logic_vector(MAX_IR_BITS-1 downto 0) := (others => '0');
     signal req_dr_len      : unsigned(15 downto 0) := (others => '0');
     signal req_dr_data     : std_logic_vector(MAX_SHIFT_BITS-1 downto 0) := (others => '0');
     signal req_tms_value   : std_logic := '0';
@@ -40,6 +42,7 @@ begin
     dut: entity work.jtag_master
         generic map (
             MAX_SHIFT_BITS => MAX_SHIFT_BITS,
+            MAX_IR_BITS => MAX_IR_BITS,
             IR_LENGTH => IR_LENGTH,
             JTAG_DIV_WIDTH => 4,
             JTAG_DIV_VALUE => 0
@@ -49,7 +52,8 @@ begin
             rst_n => rst_n,
             req_valid => req_valid,
             req_kind => req_kind,
-            req_ir => req_ir,
+            req_ir_len => req_ir_len,
+            req_ir_data => req_ir_data,
             req_dr_len => req_dr_len,
             req_dr_data => req_dr_data,
             req_tms_value => req_tms_value,
@@ -68,10 +72,12 @@ begin
         variable tck_before : std_logic;
         variable tck_edges  : natural;
         variable dr_payload : std_logic_vector(MAX_SHIFT_BITS-1 downto 0);
+        variable ir_payload : std_logic_vector(MAX_IR_BITS-1 downto 0);
 
         procedure issue_req(
             constant kind      : in jtag_req_kind_t;
-            constant ir_val    : in std_logic_vector(7 downto 0);
+            constant ir_len_v  : in natural;
+            constant ir_val    : in std_logic_vector(MAX_IR_BITS-1 downto 0);
             constant dr_len_v  : in natural;
             constant dr_data_v : in std_logic_vector(MAX_SHIFT_BITS-1 downto 0);
             constant tms_val   : in std_logic;
@@ -80,7 +86,8 @@ begin
         begin
             wait until rising_edge(clk);
             req_kind <= kind;
-            req_ir <= ir_val;
+            req_ir_len <= to_unsigned(ir_len_v, req_ir_len'length);
+            req_ir_data <= ir_val;
             req_dr_len <= to_unsigned(dr_len_v, req_dr_len'length);
             req_dr_data <= dr_data_v;
             req_tms_value <= tms_val;
@@ -110,18 +117,18 @@ begin
         assert jtag_tms = '1' report "TMS reset value mismatch" severity failure;
         assert jtag_tdi = '0' report "TDI reset value mismatch" severity failure;
 
-        issue_req(JTAG_REQ_SET_TMS, x"00", 0, (others => '0'), '0', 0);
+        issue_req(JTAG_REQ_SET_TMS, 0, (others => '0'), 0, (others => '0'), '0', 0);
         wait_done;
         assert jtag_tms = '0' report "SET_TMS low failed" severity failure;
         assert rsp_dr_len = 0 report "SET_TMS should clear DR length" severity failure;
 
-        issue_req(JTAG_REQ_SET_TMS, x"00", 0, (others => '0'), '1', 0);
+        issue_req(JTAG_REQ_SET_TMS, 0, (others => '0'), 0, (others => '0'), '1', 0);
         wait_done;
         assert jtag_tms = '1' report "SET_TMS high failed" severity failure;
 
         tck_before := jtag_tck;
         tck_edges := 0;
-        issue_req(JTAG_REQ_TOGGLE_TCK, x"00", 0, (others => '0'), '0', 5);
+        issue_req(JTAG_REQ_TOGGLE_TCK, 0, (others => '0'), 0, (others => '0'), '0', 5);
         while busy = '0' loop
             wait until rising_edge(clk);
         end loop;
@@ -136,44 +143,55 @@ begin
         assert done = '1' report "TOGGLE_TCK should complete with done pulse" severity failure;
         wait until rising_edge(clk);
 
-        issue_req(JTAG_REQ_RESET, x"00", 0, (others => '0'), '0', 4);
+        issue_req(JTAG_REQ_RESET, 0, (others => '0'), 0, (others => '0'), '0', 4);
         wait_done;
         assert jtag_tms = '0' report "RESET should finish in Run-Test/Idle" severity failure;
 
         jtag_tdo <= '1';
         dr_payload := (others => '0');
         dr_payload(3 downto 0) := "1010";
-        issue_req(JTAG_REQ_SHIFT_DR, x"00", 4, dr_payload, '0', 0);
+        issue_req(JTAG_REQ_SHIFT_DR, 0, (others => '0'), 4, dr_payload, '0', 0);
         wait_done;
         assert rsp_dr_len = 4 report "SHIFT_DR response length mismatch" severity failure;
         assert rsp_dr_data(3 downto 0) = "1111" report "SHIFT_DR capture mismatch" severity failure;
 
         jtag_tdo <= '0';
-        issue_req(JTAG_REQ_SHIFT_IR, x"05", 0, (others => '0'), '0', 0);
+        ir_payload := (others => '0');
+        ir_payload(3 downto 0) := "0101";
+        issue_req(JTAG_REQ_SHIFT_IR, IR_LENGTH, ir_payload, 0, (others => '0'), '0', 0);
         wait_done;
         assert jtag_tms = '0' report "SHIFT_IR should return to idle" severity failure;
+
+        ir_payload := (others => '0');
+        ir_payload(11 downto 0) := "101001011001";
+        issue_req(JTAG_REQ_SHIFT_IR, 12, ir_payload, 0, (others => '0'), '0', 0);
+        wait_done;
+        assert jtag_tms = '0' report "Wide SHIFT_IR should return to idle" severity failure;
 
         dr_payload := (others => '0');
         dr_payload(3 downto 0) := "1100";
         jtag_tdo <= '1';
-        issue_req(JTAG_REQ_SHIFT_IR_DR, x"03", 4, dr_payload, '0', 0);
+        ir_payload := (others => '0');
+        ir_payload(3 downto 0) := "0011";
+        issue_req(JTAG_REQ_SHIFT_IR_DR, 4, ir_payload, 4, dr_payload, '0', 0);
         wait_done;
         assert rsp_dr_len = 4 report "SHIFT_IR_DR response length mismatch" severity failure;
         assert jtag_tms = '0' report "SHIFT_IR_DR should finish in idle" severity failure;
 
         jtag_tdo <= '0';
-        issue_req(JTAG_REQ_SHIFT_DR, x"00", 0, (others => '0'), '0', 0);
+        issue_req(JTAG_REQ_SHIFT_DR, 0, (others => '0'), 0, (others => '0'), '0', 0);
         wait_done;
         assert rsp_dr_len = 0 report "Zero-length DR should report zero length" severity failure;
 
-        issue_req(JTAG_REQ_TOGGLE_TCK, x"00", 0, (others => '0'), '0', 0);
+        issue_req(JTAG_REQ_TOGGLE_TCK, 0, (others => '0'), 0, (others => '0'), '0', 0);
         wait_done;
 
-        issue_req(JTAG_REQ_TOGGLE_TCK, x"00", 0, (others => '0'), '0', 6);
+        issue_req(JTAG_REQ_TOGGLE_TCK, 0, (others => '0'), 0, (others => '0'), '0', 6);
         while busy = '0' loop
             wait until rising_edge(clk);
         end loop;
         req_kind <= JTAG_REQ_SET_TMS;
+        req_ir_len <= (others => '0');
         req_tms_value <= '0';
         req_valid <= '1';
         wait until rising_edge(clk);

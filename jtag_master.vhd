@@ -6,6 +6,7 @@ use work.jtag_pkg.all;
 entity jtag_master is
     generic (
         MAX_SHIFT_BITS   : natural := 1024;
+        MAX_IR_BITS      : natural := MAX_IR_LENGTH;
         IR_LENGTH        : natural := 4;
         JTAG_DIV_WIDTH   : natural := 8;
         JTAG_DIV_VALUE   : natural := 255
@@ -16,7 +17,8 @@ entity jtag_master is
 
         req_valid       : in  std_logic;
         req_kind        : in  jtag_req_kind_t;
-        req_ir          : in  std_logic_vector(7 downto 0);
+        req_ir_len      : in  unsigned(15 downto 0);
+        req_ir_data     : in  std_logic_vector(MAX_IR_BITS-1 downto 0);
         req_dr_len      : in  unsigned(15 downto 0);
         req_dr_data     : in  std_logic_vector(MAX_SHIFT_BITS-1 downto 0);
         req_tms_value   : in  std_logic;
@@ -44,6 +46,14 @@ architecture rtl of jtag_master is
         return b;
     end function;
 
+    function clamp_u16(value : unsigned(15 downto 0); limit : natural) return unsigned is
+    begin
+        if to_integer(value) > limit then
+            return to_unsigned(limit, 16);
+        end if;
+        return value;
+    end function;
+
     type jtag_state_t is (
         ST_IDLE,
         ST_SET_TMS_DONE,
@@ -63,7 +73,8 @@ architecture rtl of jtag_master is
     signal next_after_ir    : jtag_state_t := ST_DONE;
 
     signal req_kind_lat     : jtag_req_kind_t := JTAG_REQ_NONE;
-    signal req_ir_lat       : std_logic_vector(7 downto 0) := (others => '0');
+    signal req_ir_len_lat   : unsigned(15 downto 0) := (others => '0');
+    signal req_ir_data_lat  : std_logic_vector(MAX_IR_BITS-1 downto 0) := (others => '0');
     signal req_dr_len_lat   : unsigned(15 downto 0) := (others => '0');
     signal req_dr_data_lat  : std_logic_vector(MAX_SHIFT_BITS-1 downto 0) := (others => '0');
     signal req_tms_lat      : std_logic := '0';
@@ -83,8 +94,8 @@ architecture rtl of jtag_master is
     signal edge_cnt         : unsigned(15 downto 0) := (others => '0');
     signal shift_len        : unsigned(15 downto 0) := (others => '0');
     signal shift_buf        : std_logic_vector(MAX_SHIFT_BITS-1 downto 0) := (others => '0');
+    signal first_dr_sample  : std_logic := '0';
 
-    constant EFFECTIVE_IR_LENGTH : natural := min_nat(IR_LENGTH, 8);
     constant DIV_RELOAD     : unsigned(JTAG_DIV_WIDTH-1 downto 0) :=
         to_unsigned(JTAG_DIV_VALUE, JTAG_DIV_WIDTH);
 
@@ -99,8 +110,8 @@ begin
     jtag_tdi <= tdi_reg;
 
     process(clk)
+        variable clamped_ir_len : unsigned(15 downto 0);
         variable clamped_dr_len : unsigned(15 downto 0);
-        variable ir_len_u       : unsigned(15 downto 0);
     begin
         if rising_edge(clk) then
             done_reg <= '0';
@@ -109,7 +120,8 @@ begin
                 state <= ST_IDLE;
                 next_after_ir <= ST_DONE;
                 req_kind_lat <= JTAG_REQ_NONE;
-                req_ir_lat <= (others => '0');
+                req_ir_len_lat <= (others => '0');
+                req_ir_data_lat <= (others => '0');
                 req_dr_len_lat <= (others => '0');
                 req_dr_data_lat <= (others => '0');
                 req_tms_lat <= '0';
@@ -125,6 +137,7 @@ begin
                 edge_cnt <= (others => '0');
                 shift_len <= (others => '0');
                 shift_buf <= (others => '0');
+                first_dr_sample <= '0';
             else
                 if div_cnt /= 0 then
                     div_cnt <= div_cnt - 1;
@@ -136,7 +149,8 @@ begin
 
                         if req_valid = '1' then
                             req_kind_lat <= req_kind;
-                            req_ir_lat <= req_ir;
+                            req_ir_len_lat <= clamp_u16(req_ir_len, MAX_IR_BITS);
+                            req_ir_data_lat <= req_ir_data;
                             req_dr_data_lat <= req_dr_data;
                             req_tms_lat <= req_tms_value;
                             req_tck_lat <= req_tck_edges;
@@ -144,12 +158,10 @@ begin
                             shift_cnt <= (others => '0');
                             edge_cnt <= (others => '0');
                             tdo_sample <= '0';
+                            first_dr_sample <= '0';
 
-                            if to_integer(req_dr_len) > MAX_SHIFT_BITS then
-                                clamped_dr_len := to_unsigned(MAX_SHIFT_BITS, 16);
-                            else
-                                clamped_dr_len := req_dr_len;
-                            end if;
+                            clamped_ir_len := clamp_u16(req_ir_len, MAX_IR_BITS);
+                            clamped_dr_len := clamp_u16(req_dr_len, MAX_SHIFT_BITS);
 
                             req_dr_len_lat <= clamped_dr_len;
                             busy_reg <= '1';
@@ -188,7 +200,7 @@ begin
                                 when JTAG_REQ_SHIFT_IR =>
                                     shift_len <= (others => '0');
                                     shift_buf <= (others => '0');
-                                    if EFFECTIVE_IR_LENGTH = 0 then
+                                    if clamped_ir_len = 0 then
                                         state <= ST_DONE;
                                     else
                                         next_after_ir <= ST_RETURN_IDLE;
@@ -211,7 +223,7 @@ begin
                                 when JTAG_REQ_SHIFT_IR_DR =>
                                     shift_len <= clamped_dr_len;
                                     shift_buf <= req_dr_data;
-                                    if EFFECTIVE_IR_LENGTH = 0 then
+                                    if clamped_ir_len = 0 then
                                         if clamped_dr_len = 0 then
                                             state <= ST_DONE;
                                         else
@@ -284,9 +296,8 @@ begin
                                     when 3 =>
                                         tms_reg <= '0';
                                         nav_cnt <= (others => '0');
-                                        ir_len_u := to_unsigned(EFFECTIVE_IR_LENGTH, 16);
-                                        shift_cnt <= ir_len_u;
-                                        tdi_reg <= req_ir_lat(0);
+                                        shift_cnt <= req_ir_len_lat;
+                                        tdi_reg <= req_ir_data_lat(0);
                                         state <= ST_SHIFT_IR;
                                     when others =>
                                         null;
@@ -304,10 +315,11 @@ begin
 
                                 if shift_cnt = 1 then
                                     tms_reg <= '1';
+                                    tdi_reg <= req_ir_data_lat(to_integer(req_ir_len_lat) - 1);
                                     nav_cnt <= (others => '0');
                                     state <= ST_EXIT_IR;
                                 else
-                                    tdi_reg <= req_ir_lat(to_integer(to_unsigned(EFFECTIVE_IR_LENGTH, 16) - shift_cnt + 1));
+                                    tdi_reg <= req_ir_data_lat(to_integer(req_ir_len_lat - shift_cnt + 1));
                                 end if;
                             end if;
                         end if;
@@ -323,12 +335,13 @@ begin
                                         tms_reg <= '1';
                                         nav_cnt <= nav_cnt + 1;
                                     when 1 =>
-                                        nav_cnt <= (others => '0');
                                         state <= next_after_ir;
                                         if next_after_ir = ST_GOTO_SHIFT_DR then
                                             tms_reg <= '1';
+                                            nav_cnt <= to_unsigned(1, nav_cnt'length);
                                         else
                                             tms_reg <= '0';
+                                            nav_cnt <= (others => '0');
                                         end if;
                                     when others =>
                                         null;
@@ -353,7 +366,8 @@ begin
                                         tms_reg <= '0';
                                         nav_cnt <= (others => '0');
                                         shift_cnt <= req_dr_len_lat;
-                                        tdi_reg <= req_dr_data_lat(to_integer(req_dr_len_lat) - 1);
+                                        tdi_reg <= req_dr_data_lat(0);
+                                        first_dr_sample <= '1';
                                         state <= ST_SHIFT_DR;
                                     when others =>
                                         null;
@@ -369,15 +383,19 @@ begin
                             if tck_reg = '0' then
                                 tdo_sample <= jtag_tdo;
                             else
-                                shift_buf <= shift_buf(MAX_SHIFT_BITS-2 downto 0) & tdo_sample;
-                                shift_cnt <= shift_cnt - 1;
-
-                                if shift_cnt = 1 then
-                                    tms_reg <= '1';
-                                    nav_cnt <= (others => '0');
-                                    state <= ST_EXIT_DR;
+                                if first_dr_sample = '1' then
+                                    first_dr_sample <= '0';
                                 else
-                                    tdi_reg <= req_dr_data_lat(to_integer(shift_cnt) - 2);
+                                    shift_buf(to_integer(req_dr_len_lat - shift_cnt)) <= tdo_sample;
+                                    shift_cnt <= shift_cnt - 1;
+
+                                    if shift_cnt = 1 then
+                                        tms_reg <= '1';
+                                        nav_cnt <= (others => '0');
+                                        state <= ST_EXIT_DR;
+                                    else
+                                        tdi_reg <= req_dr_data_lat(to_integer(req_dr_len_lat - shift_cnt + 1));
+                                    end if;
                                 end if;
                             end if;
                         end if;
