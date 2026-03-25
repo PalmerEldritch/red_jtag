@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Minimal FTDI FIFO host tool for split-top and monolith bring-up."""
+"""Minimal FTDI FIFO host tool for split-top and monolith bring-up.
+
+Known-good ESP32 IDCODE test:
+    1. Put the ESP32 into manual boot/programming mode by holding BOOT and pressing RST.
+    2. Run:
+           python esp32_idcode_probe.py --profile split --index 1
+
+Expected result:
+    Raw IDCODE bytes: e5340012
+    IDCODE candidate: 0x120034E5
+"""
 
 from __future__ import annotations
 
